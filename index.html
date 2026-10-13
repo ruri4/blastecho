@@ -1,1672 +1,2590 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>BLAST ECHO</title>
-<style>
-  * {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-    user-select: none;
-    -webkit-user-select: none;
-    -webkit-touch-callout: none;
-  }
-  html, body {
-    width: 100%;
-    height: 100%;
-    overflow: hidden;
-    background-color: #0b0e15;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    touch-action: none;
-  }
-  canvas {
-    display: block;
-    width: 100%;
-    height: 100%;
-    touch-action: none;
-    cursor: pointer;
-  }
-</style>
-</head>
-<body>
-<canvas id="gameCanvas"></canvas>
-<script>
-(() => {
-  'use strict';
-
-  // ============================================================================
-  // TUNABLE GAME CONSTANTS
-  // ============================================================================
-  const FIXED_DT = 1 / 120;            // 120 Hz deterministic simulation step
-  const GRAVITY = 250;                 // Constant downward gravity (px/s^2)
-  const THRUST_POWER = 640;            // Max thruster acceleration along nose (px/s^2)
-  const THRUST_RAMP_UP = 1 / 0.12;     // ~120 ms ramp from 0 to full thrust
-  const THRUST_RAMP_DOWN = 1 / 0.11;   // ~110 ms ramp from full thrust to 0
-  const VELOCITY_DAMPING = 0.9925;     // Light velocity damping per 120 Hz tick
-  const MAX_SPEED = 275;               // Maximum rocket speed clamp (px/s)
-  const ROT_EASE_THRUST = 22.0;        // Rotation easing speed while firing thruster
-  const ROT_EASE_COAST = 9.5;          // Rotation easing speed while coasting
-
-  const CELL_SIZE = 4;                 // Destructible terrain cell size (world px)
-  const CRATER_RADIUS = 42;            // Crater radius (tuned so 3-6 blasts open a pinch)
-  const TUNNEL_LENGTH = 5200;          // Distance from start pad to finish line (~7 screens)
-  const GHOST_RENDER_CAP = 25;         // Max rendered ghosts (older ones still carve craters)
-  const RESPAWN_DELAY = 0.7;           // Auto-restart delay after death (seconds)
-
-  // World & grid dimensions
-  const START_X = 240;
-  const FINISH_X = START_X + TUNNEL_LENGTH;
-  const WORLD_WIDTH = FINISH_X + 440;  // 5880 world px total
-  const WORLD_HEIGHT = 720;            // 720 world px tall
-  const GRID_W = Math.floor(WORLD_WIDTH / CELL_SIZE);   // 1470 cells
-  const GRID_H = Math.floor(WORLD_HEIGHT / CELL_SIZE);  // 180 cells
-  const MAX_TICKS = 120 * 90;          // 90 seconds max recording buffer per run
-
-  // Rocket hull collision sample offsets (local rocket space: +x nose, +y belly)
-  const HULL_POINTS = [
-    [14, 0],
-    [7, -6], [7, 6],
-    [-2, -7], [-2, 7],
-    [-11, -7], [-11, 7],
-    [-13, 0]
-  ];
-
-  // ============================================================================
-  // SEEDED PRNG (Mulberry32)
-  // ============================================================================
-  function mulberry32(seed) {
-    let a = seed >>> 0;
-    return function() {
-      a = (a + 0x6D2B79F5) >>> 0;
-      let t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-  }
-
-  // ============================================================================
-  // WEBAUDIO SYNTHESIZED SOUND SYSTEM
-  // ============================================================================
-  const sound = {
-    ctx: null,
-    muted: false,
-    initialized: false,
-    thrustGain: null,
-    thrustFilter: null,
-    subOsc: null,
-    subGain: null,
-    noiseBuffer: null,
-
-    init() {
-      if (this.initialized) {
-        if (this.ctx && this.ctx.state === 'suspended') {
-          this.ctx.resume();
-        }
-        return;
-      }
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      if (!AudioCtx) return;
-
-      this.ctx = new AudioCtx();
-      this.initialized = true;
-
-      // Create 2 seconds of white/pink-ish noise buffer
-      const sampleRate = this.ctx.sampleRate;
-      const length = sampleRate * 2;
-      this.noiseBuffer = this.ctx.createBuffer(1, length, sampleRate);
-      const data = this.noiseBuffer.getChannelData(0);
-      let b0 = 0, b1 = 0, b2 = 0;
-      for (let i = 0; i < length; i++) {
-        const white = Math.random() * 2 - 1;
-        b0 = 0.997 * b0 + white * 0.029;
-        b1 = 0.985 * b1 + white * 0.032;
-        b2 = 0.950 * b2 + white * 0.048;
-        data[i] = (b0 + b1 + b2 + white * 0.18) * 0.5;
-      }
-
-      // Continuous thruster noise loop
-      const noiseSource = this.ctx.createBufferSource();
-      noiseSource.buffer = this.noiseBuffer;
-      noiseSource.loop = true;
-
-      this.thrustFilter = this.ctx.createBiquadFilter();
-      this.thrustFilter.type = 'bandpass';
-      this.thrustFilter.frequency.value = 220;
-      this.thrustFilter.Q.value = 0.9;
-
-      this.thrustGain = this.ctx.createGain();
-      this.thrustGain.gain.value = 0.0001;
-
-      noiseSource.connect(this.thrustFilter);
-      this.thrustFilter.connect(this.thrustGain);
-      this.thrustGain.connect(this.ctx.destination);
-      noiseSource.start();
-
-      // Continuous low rocket rumble oscillator
-      this.subOsc = this.ctx.createOscillator();
-      this.subOsc.type = 'sawtooth';
-      this.subOsc.frequency.value = 58;
-
-      const subFilter = this.ctx.createBiquadFilter();
-      subFilter.type = 'lowpass';
-      subFilter.frequency.value = 130;
-
-      this.subGain = this.ctx.createGain();
-      this.subGain.gain.value = 0.0001;
-
-      this.subOsc.connect(subFilter);
-      subFilter.connect(this.subGain);
-      this.subGain.connect(this.ctx.destination);
-      this.subOsc.start();
-    },
-
-    setThrust(level) {
-      if (!this.initialized || !this.ctx) return;
-      const now = this.ctx.currentTime;
-      const activeLevel = (this.muted || paused) ? 0 : level;
-      const targetGain = activeLevel * 0.22;
-      const targetSub = activeLevel * 0.09;
-      const targetFreq = 180 + activeLevel * 520;
-      const targetSubFreq = 52 + activeLevel * 34;
-
-      this.thrustGain.gain.setTargetAtTime(Math.max(0.0001, targetGain), now, 0.025);
-      this.subGain.gain.setTargetAtTime(Math.max(0.0001, targetSub), now, 0.025);
-      this.thrustFilter.frequency.setTargetAtTime(targetFreq, now, 0.03);
-      this.subOsc.frequency.setTargetAtTime(targetSubFreq, now, 0.03);
-    },
-
-    playExplosion(intensity = 1.0, isGhost = false) {
-      if (!this.initialized || !this.ctx || this.muted || intensity <= 0.04) return;
-      const now = this.ctx.currentTime;
-      const dur = isGhost ? 0.34 : 0.52;
-
-      // Noise burst
-      const src = this.ctx.createBufferSource();
-      src.buffer = this.noiseBuffer;
-
-      const filter = this.ctx.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(isGhost ? 520 : 820, now);
-      filter.frequency.exponentialRampToValueAtTime(55, now + dur);
-
-      const gain = this.ctx.createGain();
-      const peak = (isGhost ? 0.24 : 0.45) * Math.min(1, intensity);
-      gain.gain.setValueAtTime(peak, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
-
-      src.connect(filter);
-      filter.connect(gain);
-      gain.connect(this.ctx.destination);
-      src.start(now);
-      src.stop(now + dur);
-
-      // Sub punch oscillator
-      const osc = this.ctx.createOscillator();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(isGhost ? 110 : 145, now);
-      osc.frequency.exponentialRampToValueAtTime(24, now + dur * 0.85);
-
-      const oscGain = this.ctx.createGain();
-      oscGain.gain.setValueAtTime(peak * 0.85, now);
-      oscGain.gain.exponentialRampToValueAtTime(0.001, now + dur * 0.85);
-
-      osc.connect(oscGain);
-      oscGain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + dur * 0.85);
-    },
-
-    playWin() {
-      if (!this.initialized || !this.ctx || this.muted) return;
-      const now = this.ctx.currentTime;
-      const notes = [261.63, 329.63, 392.00, 523.25];
-      for (let i = 0; i < notes.length; i++) {
-        const osc = this.ctx.createOscillator();
-        const gain = this.ctx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(notes[i], now + i * 0.08);
-        gain.gain.setValueAtTime(0.001, now + i * 0.08);
-        gain.gain.linearRampToValueAtTime(0.14, now + i * 0.08 + 0.03);
-        gain.gain.exponentialRampToValueAtTime(0.0008, now + i * 0.08 + 0.55);
-        osc.connect(gain);
-        gain.connect(this.ctx.destination);
-        osc.start(now + i * 0.08);
-        osc.stop(now + i * 0.08 + 0.56);
-      }
-    },
-
-    toggleMute() {
-      this.init();
-      this.muted = !this.muted;
-      if (this.muted) this.setThrust(0);
-    }
-  };
-
-  // ============================================================================
-  // TERRAIN BUFFERS & OFFSCREEN RENDERING
-  // ============================================================================
-  // Cell values: 0 = empty air, 1 = natural rock, 2 = scorched crater rock, 3 = permanent border
-  const pristineGrid = new Uint8Array(GRID_W * GRID_H);
-  const activeGrid = new Uint8Array(GRID_W * GRID_H);
-  const centerlineY = new Float32Array(GRID_W);
-
-  // Offscreen canvases at 1px per grid cell (with 2x2 subpixel beveling = 2940x360)
-  const SUB_PX = 2;
-  const OFFSCREEN_W = GRID_W * SUB_PX;
-  const OFFSCREEN_H = GRID_H * SUB_PX;
-
-  const pristineCanvas = document.createElement('canvas');
-  pristineCanvas.width = OFFSCREEN_W;
-  pristineCanvas.height = OFFSCREEN_H;
-  const pristineCtx = pristineCanvas.getContext('2d');
-
-  const activeTerrainCanvas = document.createElement('canvas');
-  activeTerrainCanvas.width = OFFSCREEN_W;
-  activeTerrainCanvas.height = OFFSCREEN_H;
-  const activeTerrainCtx = activeTerrainCanvas.getContext('2d');
-
-  // Pre-allocated ImageData buffers for zero-allocation terrain & crater updates
-  const fullImageData = pristineCtx.createImageData(OFFSCREEN_W, OFFSCREEN_H);
-  const fullPixels32 = new Uint32Array(fullImageData.data.buffer);
-
-  const PATCH_CELLS = 40; // Enough to cover any crater + highlight rim
-  const PATCH_PX = PATCH_CELLS * SUB_PX;
-  const patchImageData = activeTerrainCtx.createImageData(PATCH_PX, PATCH_PX);
-  const patchPixels32 = new Uint32Array(patchImageData.data.buffer);
-
-  // Pack RGBA into little-endian ABGR Uint32
-  function packRGBA(r, g, b, a) {
-    return ((a & 255) << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255);
-  }
-
-  const COL_EMPTY = 0x00000000;
-  const COL_ROCK_DEEP_A = packRGBA(18, 23, 34, 255);
-  const COL_ROCK_DEEP_B = packRGBA(22, 28, 41, 255);
-  const COL_ROCK_DEEP_C = packRGBA(15, 19, 29, 255);
-  const COL_ROCK_MID = packRGBA(42, 54, 74, 255);
-  const COL_ROCK_EDGE = packRGBA(94, 118, 152, 255);
-  const COL_SCORCH_MID = packRGBA(78, 46, 44, 255);
-  const COL_SCORCH_EDGE = packRGBA(218, 116, 62, 255);
-
-  function computeCellColor(grid, gx, gy, cellVal) {
-    const idx = gy * GRID_W + gx;
-    const u = gy > 0 ? grid[idx - GRID_W] : 3;
-    const d = gy < GRID_H - 1 ? grid[idx + GRID_W] : 3;
-    const l = gx > 0 ? grid[idx - 1] : 3;
-    const r = gx < GRID_W - 1 ? grid[idx + 1] : 3;
-
-    // Direct neighbor is air -> bright edge highlight
-    if (u === 0 || d === 0 || l === 0 || r === 0) {
-      return cellVal === 2 ? COL_SCORCH_EDGE : COL_ROCK_EDGE;
-    }
-
-    // Distance-2 neighbor is air -> mid-tone bevel band
-    const u2 = gy > 1 ? grid[idx - GRID_W * 2] : 3;
-    const d2 = gy < GRID_H - 2 ? grid[idx + GRID_W * 2] : 3;
-    const l2 = gx > 1 ? grid[idx - 2] : 3;
-    const r2 = gx < GRID_W - 2 ? grid[idx + 2] : 3;
-    const ul = (gy > 0 && gx > 0) ? grid[idx - GRID_W - 1] : 3;
-    const ur = (gy > 0 && gx < GRID_W - 1) ? grid[idx - GRID_W + 1] : 3;
-    const dl = (gy < GRID_H - 1 && gx > 0) ? grid[idx + GRID_W - 1] : 3;
-    const dr = (gy < GRID_H - 1 && gx < GRID_W - 1) ? grid[idx + GRID_W + 1] : 3;
-
-    if (u2 === 0 || d2 === 0 || l2 === 0 || r2 === 0 || ul === 0 || ur === 0 || dl === 0 || dr === 0) {
-      return cellVal === 2 ? COL_SCORCH_MID : COL_ROCK_MID;
-    }
-
-    // Interior rock strata pattern
-    const stratum = (gy + ((gx * 5) >> 5)) & 7;
-    if (stratum === 0 || stratum === 1) return COL_ROCK_DEEP_B;
-    if (stratum === 4) return COL_ROCK_DEEP_C;
-    return COL_ROCK_DEEP_A;
-  }
-
-  function renderFullPristineTerrain() {
-    fullPixels32.fill(COL_EMPTY);
-    for (let gy = 0; gy < GRID_H; gy++) {
-      const rowOffset = gy * GRID_W;
-      const py0 = gy * SUB_PX * OFFSCREEN_W;
-      const py1 = (gy * SUB_PX + 1) * OFFSCREEN_W;
-
-      for (let gx = 0; gx < GRID_W; gx++) {
-        const val = pristineGrid[rowOffset + gx];
-        if (val === 0) continue;
-
-        const color = computeCellColor(pristineGrid, gx, gy, val);
-        const idx = rowOffset + gx;
-        const u = gy > 0 ? pristineGrid[idx - GRID_W] : 3;
-        const d = gy < GRID_H - 1 ? pristineGrid[idx + GRID_W] : 3;
-        const l = gx > 0 ? pristineGrid[idx - 1] : 3;
-        const r = gx < GRID_W - 1 ? pristineGrid[idx + 1] : 3;
-
-        const px = gx * SUB_PX;
-        // 45-degree subpixel corner beveling so 4px cells look smooth and natural
-        fullPixels32[py0 + px]     = (u === 0 && l === 0) ? COL_EMPTY : color;
-        fullPixels32[py0 + px + 1] = (u === 0 && r === 0) ? COL_EMPTY : color;
-        fullPixels32[py1 + px]     = (d === 0 && l === 0) ? COL_EMPTY : color;
-        fullPixels32[py1 + px + 1] = (d === 0 && r === 0) ? COL_EMPTY : color;
-      }
-    }
-    pristineCtx.putImageData(fullImageData, 0, 0);
-  }
-
-  function updateTerrainPatch(minGx, minGy, maxGx, maxGy) {
-    const wCells = maxGx - minGx + 1;
-    const hCells = maxGy - minGy + 1;
-    if (wCells <= 0 || hCells <= 0 || wCells > PATCH_CELLS || hCells > PATCH_CELLS) return;
-
-    for (let ly = 0; ly < hCells; ly++) {
-      const gy = minGy + ly;
-      const rowOffset = gy * GRID_W;
-      const py0 = (ly * SUB_PX) * PATCH_PX;
-      const py1 = (ly * SUB_PX + 1) * PATCH_PX;
-
-      for (let lx = 0; lx < wCells; lx++) {
-        const gx = minGx + lx;
-        const val = activeGrid[rowOffset + gx];
-        const px = lx * SUB_PX;
-
-        if (val === 0) {
-          patchPixels32[py0 + px] = COL_EMPTY;
-          patchPixels32[py0 + px + 1] = COL_EMPTY;
-          patchPixels32[py1 + px] = COL_EMPTY;
-          patchPixels32[py1 + px + 1] = COL_EMPTY;
-          continue;
-        }
-
-        const color = computeCellColor(activeGrid, gx, gy, val);
-        const idx = rowOffset + gx;
-        const u = gy > 0 ? activeGrid[idx - GRID_W] : 3;
-        const d = gy < GRID_H - 1 ? activeGrid[idx + GRID_W] : 3;
-        const l = gx > 0 ? activeGrid[idx - 1] : 3;
-        const r = gx < GRID_W - 1 ? activeGrid[idx + 1] : 3;
-
-        patchPixels32[py0 + px]     = (u === 0 && l === 0) ? COL_EMPTY : color;
-        patchPixels32[py0 + px + 1] = (u === 0 && r === 0) ? COL_EMPTY : color;
-        patchPixels32[py1 + px]     = (d === 0 && l === 0) ? COL_EMPTY : color;
-        patchPixels32[py1 + px + 1] = (d === 0 && r === 0) ? COL_EMPTY : color;
-      }
-    }
-
-    activeTerrainCtx.putImageData(
-      patchImageData,
-      minGx * SUB_PX,
-      minGy * SUB_PX,
-      0,
-      0,
-      wCells * SUB_PX,
-      hCells * SUB_PX
-    );
-  }
-
-  function resetTerrainToPristine() {
-    activeGrid.set(pristineGrid);
-    activeTerrainCtx.clearRect(0, 0, OFFSCREEN_W, OFFSCREEN_H);
-    activeTerrainCtx.drawImage(pristineCanvas, 0, 0);
-  }
-
-  // Deterministic crater carving
-  function carveCrater(worldX, worldY) {
-    const r = CRATER_RADIUS;
-    const maxR = r + 10;
-    const minGx = Math.max(2, Math.floor((worldX - maxR) / CELL_SIZE));
-    const maxGx = Math.min(GRID_W - 3, Math.ceil((worldX + maxR) / CELL_SIZE));
-    const minGy = Math.max(3, Math.floor((worldY - maxR) / CELL_SIZE));
-    const maxGy = Math.min(GRID_H - 4, Math.ceil((worldY + maxR) / CELL_SIZE));
-
-    for (let gy = minGy; gy <= maxGy; gy++) {
-      const cy = (gy + 0.5) * CELL_SIZE;
-      const dy = cy - worldY;
-      const rowOffset = gy * GRID_W;
-
-      for (let gx = minGx; gx <= maxGx; gx++) {
-        const idx = rowOffset + gx;
-        if (activeGrid[idx] === 3) continue; // Indestructible outer world boundary
-
-        const cx = (gx + 0.5) * CELL_SIZE;
-        const dx = cx - worldX;
-        const dist = Math.hypot(dx, dy);
-
-        // Deterministic jagged edge noise based on angle & cell coordinates
-        const ang = Math.atan2(dy, dx);
-        const hash = (((gx * 374761393) ^ (gy * 668265263)) >>> 0) & 255;
-        const jag = Math.sin(ang * 7 + worldX * 0.11) * 3.0
-                  + Math.cos(ang * 11 - worldY * 0.13) * 2.2
-                  + (hash / 255 - 0.5) * 3.2;
-        const effR = r + jag;
-
-        if (dist <= effR) {
-          activeGrid[idx] = 0;
-        } else if (dist <= effR + CELL_SIZE * 2.3 && activeGrid[idx] === 1) {
-          activeGrid[idx] = 2; // Scorched crater rim
-        }
-      }
-    }
-
-    updateTerrainPatch(
-      Math.max(0, minGx - 2),
-      Math.max(0, minGy - 2),
-      Math.min(GRID_W - 1, maxGx + 2),
-      Math.min(GRID_H - 1, maxGy + 2)
-    );
-  }
-
-  // ============================================================================
-  // SEEDED TUNNEL GENERATION WITH PINCH POINTS
-  // ============================================================================
-  let currentSeed = 0x5F3759DF;
-  let pinchLocations = [];
-
-  function generateTunnel(seed) {
-    const rng = mulberry32(seed);
-    pristineGrid.fill(1);
-
-    //Layered sine parameters for winding centerline
-    const p1 = rng() * Math.PI * 2;
-    const p2 = rng() * Math.PI * 2;
-    const p3 = rng() * Math.PI * 2;
-    const f1 = 0.0016 + rng() * 0.0005;
-    const f2 = 0.0041 + rng() * 0.0009;
-    const f3 = 0.0095 + rng() * 0.0020;
-
-    // 4 pinch points spaced along the tunnel; first pinch is close enough to reach on Attempt 1
-    pinchLocations = [
-      { x: START_X + 600 + (rng() - 0.5) * 70,  plateau: 38, ramp: 58 }, // Pinch 1 (~3-4 blasts)
-      { x: START_X + 1780 + (rng() - 0.5) * 120, plateau: 48, ramp: 62 }, // Pinch 2 (~4-5 blasts)
-      { x: START_X + 3050 + (rng() - 0.5) * 120, plateau: 52, ramp: 65 }, // Pinch 3 (~4-6 blasts)
-      { x: START_X + 4300 + (rng() - 0.5) * 120, plateau: 56, ramp: 68 }  // Pinch 4 (~4-6 blasts)
-    ];
-
-    // Precompute smooth centerline Y for each column
-    const midY = WORLD_HEIGHT * 0.5;
-    for (let gx = 0; gx < GRID_W; gx++) {
-      const wx = (gx + 0.5) * CELL_SIZE;
-
-      // Smooth envelope so start zone and finish zone ease toward vertical center
-      let env = 1.0;
-      if (wx < START_X + 260) {
-        env = Math.max(0, (wx - START_X) / 260);
-        env = env * env * (3 - 2 * env);
-      } else if (wx > FINISH_X - 300) {
-        const t = Math.max(0, 1 - (wx - (FINISH_X - 300)) / 350);
-        env = t * t * (3 - 2 * t);
-      }
-
-      const wave = Math.sin(wx * f1 + p1) * 115
-                 + Math.sin(wx * f2 + p2) * 52
-                 + Math.sin(wx * f3 + p3) * 18;
-      centerlineY[gx] = midY + wave * env;
-    }
-
-    // Flatten centerline slope slightly inside pinch points so the narrow crack stays readable
-    for (let i = 0; i < pinchLocations.length; i++) {
-      const pinch = pinchLocations[i];
-      const centerGx = Math.min(GRID_W - 1, Math.max(0, Math.round(pinch.x / CELL_SIZE)));
-      const anchorY = centerlineY[centerGx];
-      const span = pinch.plateau + pinch.ramp;
-      const minGx = Math.max(0, Math.floor((pinch.x - span) / CELL_SIZE));
-      const maxGx = Math.min(GRID_W - 1, Math.ceil((pinch.x + span) / CELL_SIZE));
-      for (let gx = minGx; gx <= maxGx; gx++) {
-        const wx = (gx + 0.5) * CELL_SIZE;
-        const dist = Math.abs(wx - pinch.x);
-        if (dist < span) {
-          const t = 1 - dist / span;
-          const blend = t * t * (3 - 2 * t) * 0.65;
-          centerlineY[gx] = centerlineY[gx] * (1 - blend) + anchorY * blend;
-        }
-      }
-    }
-
-    // Wall roughness phases
-    const wp1 = rng() * 10, wp2 = rng() * 10, wp3 = rng() * 10, wp4 = rng() * 10;
-
-    for (let gx = 0; gx < GRID_W; gx++) {
-      const wx = (gx + 0.5) * CELL_SIZE;
-      const cy = centerlineY[gx];
-
-      // Closed solid end-wall behind start zone
-      if (wx < 90) {
-        for (let gy = 0; gy < GRID_H; gy++) {
-          pristineGrid[gy * GRID_W + gx] = 3;
-        }
-        continue;
-      }
-
-      // Base half-width of the cave
-      let halfGap = 86 + Math.sin(wx * 0.0032 + wp1) * 16 + Math.cos(wx * 0.0075 + wp2) * 9;
-
-      // Roomy start bay
-      if (wx < START_X + 200) {
-        const startBlend = Math.max(0, 1 - Math.max(0, wx - START_X) / 200);
-        halfGap = halfGap * (1 - startBlend) + 118 * startBlend;
-        if (wx < 140) {
-          const capT = (wx - 90) / 50;
-          halfGap *= Math.sqrt(Math.max(0, capT));
-        }
-      }
-
-      // Wide finish cavern
-      if (wx > FINISH_X - 220) {
-        const finBlend = Math.min(1, (wx - (FINISH_X - 220)) / 220);
-        halfGap = halfGap * (1 - finBlend) + 135 * finBlend;
-      }
-
-      // Apply pinch points (narrows down to a 7px crack — narrower than the 16px rocket)
-      let pinchStrength = 0;
-      for (let i = 0; i < pinchLocations.length; i++) {
-        const p = pinchLocations[i];
-        const adx = Math.abs(wx - p.x);
-        if (adx <= p.plateau) {
-          pinchStrength = 1.0;
-          break;
-        } else if (adx < p.plateau + p.ramp) {
-          const u = (adx - p.plateau) / p.ramp;
-          const s = 0.5 + 0.5 * Math.cos(u * Math.PI);
-          if (s > pinchStrength) pinchStrength = s;
-        }
-      }
-
-      const minSlitHalf = 3.5; // 7px total vertical slit (rocket is ~16px tall)
-      halfGap = halfGap * (1 - pinchStrength) + minSlitHalf * pinchStrength;
-
-      // Cave wall roughness (attenuated inside pinch points for consistent 3-6 blast carving)
-      const roughScale = 1 - pinchStrength * 0.88;
-      const topRough = (Math.sin(wx * 0.043 + wp3) * 9 + Math.sin(wx * 0.11 + wp1) * 5) * roughScale;
-      const botRough = (Math.cos(wx * 0.039 + wp4) * 9 + Math.cos(wx * 0.105 + wp2) * 5) * roughScale;
-
-      const topEdge = cy - halfGap + topRough;
-      const botEdge = cy + halfGap + botRough;
-
-      for (let gy = 0; gy < GRID_H; gy++) {
-        const idx = gy * GRID_W + gx;
-        if (gy < 3 || gy >= GRID_H - 3) {
-          pristineGrid[idx] = 3; // Indestructible world boundary
-          continue;
-        }
-        const wy = (gy + 0.5) * CELL_SIZE;
-        if (wy > topEdge && wy < botEdge) {
-          pristineGrid[idx] = 0;
-        } else {
-          pristineGrid[idx] = 1;
-        }
-      }
-    }
-
-    renderFullPristineTerrain();
-    resetTerrainToPristine();
-  }
-
-  // ============================================================================
-  // ZERO-ALLOCATION PARTICLE & FLASH POOLS
-  // ============================================================================
-  const MAX_PARTICLES = 600;
-  const partX = new Float32Array(MAX_PARTICLES);
-  const partY = new Float32Array(MAX_PARTICLES);
-  const partVx = new Float32Array(MAX_PARTICLES);
-  const partVy = new Float32Array(MAX_PARTICLES);
-  const partLife = new Float32Array(MAX_PARTICLES);
-  const partMaxLife = new Float32Array(MAX_PARTICLES);
-  const partSize = new Float32Array(MAX_PARTICLES);
-  const partType = new Uint8Array(MAX_PARTICLES); // 0=exhaust, 1=spark, 2=debris, 3=ghostBlast
-  let partHead = 0;
-
-  function spawnParticle(x, y, vx, vy, life, size, type) {
-    const i = partHead;
-    partHead = (partHead + 1) % MAX_PARTICLES;
-    partX[i] = x;
-    partY[i] = y;
-    partVx[i] = vx;
-    partVy[i] = vy;
-    partLife[i] = life;
-    partMaxLife[i] = life;
-    partSize[i] = size;
-    partType[i] = type;
-  }
-
-  const MAX_FLASHES = 24;
-  const flashX = new Float32Array(MAX_FLASHES);
-  const flashY = new Float32Array(MAX_FLASHES);
-  const flashLife = new Float32Array(MAX_FLASHES);
-  const flashMaxLife = new Float32Array(MAX_FLASHES);
-  const flashRadius = new Float32Array(MAX_FLASHES);
-  const flashGhost = new Uint8Array(MAX_FLASHES);
-  let flashHead = 0;
-
-  function spawnFlash(x, y, radius, duration, isGhost) {
-    const i = flashHead;
-    flashHead = (flashHead + 1) % MAX_FLASHES;
-    flashX[i] = x;
-    flashY[i] = y;
-    flashRadius[i] = radius;
-    flashLife[i] = duration;
-    flashMaxLife[i] = duration;
-    flashGhost[i] = isGhost ? 1 : 0;
-  }
-
-  function spawnExplosionEffects(x, y, isGhost) {
-    spawnFlash(x, y, CRATER_RADIUS * 1.45, isGhost ? 0.28 : 0.38, isGhost);
-    const sparkCount = isGhost ? 22 : 42;
-    for (let i = 0; i < sparkCount; i++) {
-      const ang = (Math.PI * 2 * i) / sparkCount + (Math.random() - 0.5) * 0.35;
-      const spd = (45 + Math.random() * 195) * (isGhost ? 0.85 : 1.0);
-      spawnParticle(
-        x + (Math.random() - 0.5) * 8,
-        y + (Math.random() - 0.5) * 8,
-        Math.cos(ang) * spd,
-        Math.sin(ang) * spd,
-        0.22 + Math.random() * 0.36,
-        (isGhost ? 2.5 : 3.5) + Math.random() * 3.5,
-        isGhost ? 3 : 1
-      );
-    }
-    const debrisCount = isGhost ? 10 : 18;
-    for (let i = 0; i < debrisCount; i++) {
-      const ang = Math.random() * Math.PI * 2;
-      const spd = 30 + Math.random() * 130;
-      spawnParticle(
-        x,
-        y,
-        Math.cos(ang) * spd,
-        Math.sin(ang) * spd - 40,
-        0.35 + Math.random() * 0.45,
-        2.5 + Math.random() * 3.0,
-        2
-      );
-    }
-  }
-
-  function updateVisualEffects(dt) {
-    for (let i = 0; i < MAX_PARTICLES; i++) {
-      if (partLife[i] <= 0) continue;
-      partLife[i] -= dt;
-      if (partType[i] === 2) {
-        partVy[i] += GRAVITY * 0.85 * dt; // Rock debris falls with gravity
-      } else {
-        partVx[i] *= 0.96;
-        partVy[i] *= 0.96;
-      }
-      partX[i] += partVx[i] * dt;
-      partY[i] += partVy[i] * dt;
-    }
-    for (let i = 0; i < MAX_FLASHES; i++) {
-      if (flashLife[i] > 0) {
-        flashLife[i] -= dt;
-      }
-    }
-  }
-
-  // ============================================================================
-  // GAME STATE, ROCKET & GHOST RECORDINGS
-  // ============================================================================
-  // States: 'START', 'PLAYING', 'DEAD', 'CLEARED'
-  let gameState = 'START';
-  let attemptCount = 1;
-  let sessionBestAttempts = null; // Stored in memory for session only
-  let ghosts = [];
-  let furthestGhostX = START_X;
-
-  // Pre-allocated staging buffer for the current run's deterministic recording
-  // 4 floats per tick: [x, y, angle, thrust]
-  const currentRunRecording = new Float32Array(MAX_TICKS * 4);
-  let currentTick = 0;
-  let stateTimer = 0;
-  let accumulator = 0;
-
-  let inputHeld = false;
-  let paused = false;
-
-  const rocket = {
-    x: START_X,
-    y: WORLD_HEIGHT * 0.5,
-    vx: 0,
-    vy: 0,
-    angle: 0,
-    thrust: 0,
-    onPad: true
-  };
-
-  let camX = 0;
-  let shakeMag = 0;
-  let shakeX = 0;
-  let shakeY = 0;
-
-  function resetRocketToStart() {
-    const startGx = Math.round(START_X / CELL_SIZE);
-    rocket.x = START_X;
-    rocket.y = centerlineY[startGx];
-    rocket.vx = 0;
-    rocket.vy = 0;
-    rocket.angle = -0.18;
-    rocket.thrust = 0;
-    rocket.onPad = true;
-  }
-
-  function startAttempt() {
-    resetTerrainToPristine();
-    resetRocketToStart();
-    currentTick = 0;
-    accumulator = 0;
-    for (let i = 0; i < ghosts.length; i++) {
-      ghosts[i].explodedThisRun = false;
-    }
-    gameState = 'PLAYING';
-  }
-
-  function startNewTunnel(seed) {
-    currentSeed = seed;
-    generateTunnel(currentSeed);
-    ghosts = [];
-    furthestGhostX = START_X;
-    attemptCount = 1;
-    partLife.fill(0);
-    flashLife.fill(0);
-    startAttempt();
-  }
-
-  // Check if any hull sample point hits solid terrain
-  function checkRocketCollision() {
-    const cos = Math.cos(rocket.angle);
-    const sin = Math.sin(rocket.angle);
-
-    for (let i = 0; i < HULL_POINTS.length; i++) {
-      const lx = HULL_POINTS[i][0];
-      const ly = HULL_POINTS[i][1];
-      const wx = rocket.x + lx * cos - ly * sin;
-      const wy = rocket.y + lx * sin + ly * cos;
-
-      const gx = Math.floor(wx / CELL_SIZE);
-      const gy = Math.floor(wy / CELL_SIZE);
-      if (gx < 0 || gx >= GRID_W || gy < 0 || gy >= GRID_H) {
-        return true;
-      }
-      if (activeGrid[gy * GRID_W + gx] !== 0) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function recordCurrentTick() {
-    if (currentTick >= MAX_TICKS) return;
-    const base = currentTick * 4;
-    currentRunRecording[base] = rocket.x;
-    currentRunRecording[base + 1] = rocket.y;
-    currentRunRecording[base + 2] = rocket.angle;
-    currentRunRecording[base + 3] = rocket.thrust;
-  }
-
-  function triggerPlayerDeath() {
-    gameState = 'DEAD';
-    stateTimer = RESPAWN_DELAY;
-    sound.setThrust(0);
-    sound.playExplosion(1.0, false);
-
-    carveCrater(rocket.x, rocket.y);
-    spawnExplosionEffects(rocket.x, rocket.y, false);
-    shakeMag = 11;
-
-    // Save deterministic ghost run
-    const recordedTick = Math.min(currentTick, MAX_TICKS - 1);
-    const framesCopy = currentRunRecording.slice(0, (recordedTick + 1) * 4);
-    ghosts.push({
-      frames: framesCopy,
-      deathTick: recordedTick,
-      deathX: rocket.x,
-      deathY: rocket.y,
-      explodedThisRun: false
-    });
-    if (rocket.x > furthestGhostX) {
-      furthestGhostX = rocket.x;
-    }
-  }
-
-  function triggerTunnelCleared() {
-    gameState = 'CLEARED';
-    stateTimer = 2.5;
-    sound.setThrust(0);
-    sound.playWin();
-
-    if (sessionBestAttempts === null || attemptCount < sessionBestAttempts) {
-      sessionBestAttempts = attemptCount;
-    }
-
-    // Celebratory exhaust burst
-    for (let i = 0; i < 45; i++) {
-      const ang = (Math.PI * 2 * i) / 45;
-      const spd = 60 + Math.random() * 170;
-      spawnParticle(
-        rocket.x,
-        rocket.y,
-        Math.cos(ang) * spd,
-        Math.sin(ang) * spd,
-        0.4 + Math.random() * 0.45,
-        3.5 + Math.random() * 3,
-        1
-      );
-    }
-  }
-
-  // ============================================================================
-  // DETERMINISTIC 120 HZ SIMULATION STEP
-  // ============================================================================
-  function simulateGhostsTick() {
-    for (let i = 0; i < ghosts.length; i++) {
-      const g = ghosts[i];
-      if (!g.explodedThisRun && currentTick >= g.deathTick) {
-        g.explodedThisRun = true;
-        carveCrater(g.deathX, g.deathY);
-
-        const dist = Math.abs(g.deathX - rocket.x);
-        if (dist < 1100) {
-          spawnExplosionEffects(g.deathX, g.deathY, true);
-          const prox = Math.max(0, 1 - dist / 950);
-          sound.playExplosion(prox * 0.75, true);
-          if (prox > 0.25) {
-            shakeMag = Math.max(shakeMag, prox * 5.0);
-          }
-        }
-      }
-    }
-  }
-
-  function stepPhysicsTick() {
-    // 1. Ghosts replay and carve craters at their exact recorded tick
-    simulateGhostsTick();
-
-    if (gameState !== 'PLAYING') {
-      currentTick++;
-      return;
-    }
-
-    // 2. Ramp thrust smoothly over ~120ms up / ~110ms down
-    if (inputHeld) {
-      rocket.thrust = Math.min(1, rocket.thrust + THRUST_RAMP_UP * FIXED_DT);
-    } else {
-      rocket.thrust = Math.max(0, rocket.thrust - THRUST_RAMP_DOWN * FIXED_DT);
-    }
-    sound.setThrust(rocket.thrust);
-
-    // 3. Launch pad holds the rocket safely in the start bay until first thrust of the run
-    if (rocket.onPad) {
-      if (inputHeld) {
-        rocket.onPad = false;
-        rocket.vx = 115;
-        rocket.vy = -42;
-        rocket.angle = -0.35;
-      } else {
-        recordCurrentTick();
-        currentTick++;
-        return;
-      }
-    }
-
-    // 4. Rotation eases toward velocity direction (with upward pitch torque when thrusting)
-    const velAngle = Math.atan2(rocket.vy, Math.max(75, rocket.vx));
-    let targetAngle = velAngle * 0.65 - rocket.thrust * 0.85;
-    if (rocket.thrust > 0.04) {
-      targetAngle = Math.min(targetAngle, -0.46 * rocket.thrust);
-    }
-    targetAngle = Math.max(-1.10, Math.min(0.62, targetAngle));
-
-    const easeRate = inputHeld ? ROT_EASE_THRUST : ROT_EASE_COAST;
-    rocket.angle += (targetAngle - rocket.angle) * easeRate * FIXED_DT;
-
-    // 5. Apply thrust along the rocket's nose direction + constant gravity
-    const accel = rocket.thrust * THRUST_POWER;
-    rocket.vx += Math.cos(rocket.angle) * accel * FIXED_DT;
-    rocket.vy += (Math.sin(rocket.angle) * accel + GRAVITY) * FIXED_DT;
-
-    // Gentle forward glide during descents so diving down slopes maintains forward momentum
-    if (rocket.vy > 0 && rocket.vx < 155) {
-      rocket.vx += rocket.vy * 0.34 * FIXED_DT;
-    }
-
-    // 6. Light velocity damping and max speed clamp
-    rocket.vx *= VELOCITY_DAMPING;
-    rocket.vy *= VELOCITY_DAMPING;
-
-    const spd = Math.hypot(rocket.vx, rocket.vy);
-    if (spd > MAX_SPEED) {
-      const scale = MAX_SPEED / spd;
-      rocket.vx *= scale;
-      rocket.vy *= scale;
-    }
-
-    // 7. Integrate position
-    rocket.x += rocket.vx * FIXED_DT;
-    rocket.y += rocket.vy * FIXED_DT;
-
-    // 8. Spawn exhaust particles scaled with current thrust
-    if (rocket.thrust > 0.05 && (currentTick & 1) === 0) {
-      const cos = Math.cos(rocket.angle);
-      const sin = Math.sin(rocket.angle);
-      const tailX = rocket.x - cos * 15;
-      const tailY = rocket.y - sin * 15;
-      const spread = (Math.random() - 0.5) * 0.38;
-      const ejectAngle = rocket.angle + Math.PI + spread;
-      const ejectSpd = 90 + rocket.thrust * 170 + Math.random() * 40;
-      spawnParticle(
-        tailX,
-        tailY,
-        rocket.vx * 0.25 + Math.cos(ejectAngle) * ejectSpd,
-        rocket.vy * 0.25 + Math.sin(ejectAngle) * ejectSpd,
-        0.10 + rocket.thrust * 0.16,
-        2.0 + rocket.thrust * 3.8,
-        0
-      );
-    }
-
-    // 9. Record tick for ghost replay
-    recordCurrentTick();
-
-    // 10. Check finish line or wall collision
-    if (rocket.x >= FINISH_X) {
-      triggerTunnelCleared();
-    } else if (checkRocketCollision()) {
-      triggerPlayerDeath();
-    }
-
-    currentTick++;
-  }
-
-  // ============================================================================
-  // RENDERING & CAMERA
-  // ============================================================================
-  const canvas = document.getElementById('gameCanvas');
-  const ctx = canvas.getContext('2d');
-  let screenW = window.innerWidth;
-  let screenH = window.innerHeight;
-  let dpr = Math.min(2, window.devicePixelRatio || 1);
-
-  // Mute button screen-space bounding box for hit detection
-  const muteBtnRect = { x: 0, y: 0, w: 96, h: 34 };
-
-  function resizeCanvas() {
-    screenW = window.innerWidth;
-    screenH = window.innerHeight;
-    dpr = Math.min(2, window.devicePixelRatio || 1);
-    canvas.width = Math.floor(screenW * dpr);
-    canvas.height = Math.floor(screenH * dpr);
-  }
-  window.addEventListener('resize', resizeCanvas);
-  resizeCanvas();
-
-  function drawRocketShape(x, y, angle, thrustLevel, isGhost, alpha, warningPulse) {
-    ctx.save();
-    ctx.translate(x, y);
-    ctx.rotate(angle);
-    ctx.globalAlpha = alpha;
-
-    // Thruster flame scaled by current thrust
-    if (thrustLevel > 0.02) {
-      const flicker = 0.88 + Math.sin(performance.now() * 0.06) * 0.14;
-      const flameLen = (8 + thrustLevel * 24) * flicker;
-      const flameHalfW = 2.5 + thrustLevel * 4.2;
-
-      ctx.beginPath();
-      ctx.moveTo(-12, -flameHalfW);
-      ctx.lineTo(-12 - flameLen, 0);
-      ctx.lineTo(-12, flameHalfW);
-      ctx.closePath();
-      ctx.fillStyle = isGhost
-        ? (warningPulse ? '#ff9f4a' : '#58d5ff')
-        : '#ff7b24';
-      ctx.fill();
-
-      // Inner bright core
-      ctx.beginPath();
-      ctx.moveTo(-12, -flameHalfW * 0.55);
-      ctx.lineTo(-12 - flameLen * 0.62, 0);
-      ctx.lineTo(-12, flameHalfW * 0.55);
-      ctx.closePath();
-      ctx.fillStyle = isGhost ? '#e0faff' : '#fff7cc';
-      ctx.fill();
-    }
-
-    if (isGhost) {
-      // Translucent ghost rocket silhouette
-      ctx.fillStyle = warningPulse ? '#ffae52' : '#7ce2ff';
-      ctx.strokeStyle = warningPulse ? '#ffe3b3' : '#c4f4ff';
-      ctx.lineWidth = 1.2;
-
-      ctx.beginPath();
-      ctx.moveTo(15, 0);
-      ctx.lineTo(5, -6.5);
-      ctx.lineTo(-11, -6.5);
-      ctx.lineTo(-14, -10);
-      ctx.lineTo(-12, 0);
-      ctx.lineTo(-14, 10);
-      ctx.lineTo(-11, 6.5);
-      ctx.lineTo(5, 6.5);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-    } else {
-      // Soft glow behind player rocket
-      const glow = ctx.createRadialGradient(0, 0, 2, 0, 0, 24);
-      glow.addColorStop(0, 'rgba(255, 160, 75, 0.32)');
-      glow.addColorStop(1, 'rgba(255, 160, 75, 0)');
-      ctx.fillStyle = glow;
-      ctx.beginPath();
-      ctx.arc(0, 0, 24, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Rear fins
-      ctx.fillStyle = '#e04f33';
-      ctx.beginPath();
-      ctx.moveTo(-5, -5);
-      ctx.lineTo(-14, -11);
-      ctx.lineTo(-12, -4);
-      ctx.closePath();
-      ctx.fill();
-
-      ctx.beginPath();
-      ctx.moveTo(-5, 5);
-      ctx.lineTo(-14, 11);
-      ctx.lineTo(-12, 4);
-      ctx.closePath();
-      ctx.fill();
-
-      // Thruster nozzle
-      ctx.fillStyle = '#38465e';
-      ctx.fillRect(-13.5, -3.5, 4, 7);
-
-      // Main fuselage
-      ctx.fillStyle = '#f2f6fc';
-      ctx.beginPath();
-      ctx.moveTo(15, 0);
-      ctx.quadraticCurveTo(8, -6.8, -10, -6.2);
-      ctx.lineTo(-10, 6.2);
-      ctx.quadraticCurveTo(8, 6.8, 15, 0);
-      ctx.closePath();
-      ctx.fill();
-
-      // Warm nose cone highlight
-      ctx.fillStyle = '#ff6b3d';
-      ctx.beginPath();
-      ctx.moveTo(15, 0);
-      ctx.quadraticCurveTo(10, -4.5, 4, -5.5);
-      ctx.lineTo(4, 5.5);
-      ctx.quadraticCurveTo(10, 4.5, 15, 0);
-      ctx.closePath();
-      ctx.fill();
-
-      // Cockpit visor
-      ctx.fillStyle = '#38bdf8';
-      ctx.beginPath();
-      ctx.ellipse(-1, 0, 4.2, 2.6, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    ctx.restore();
-  }
-
-  function renderGhosts(minVisibleX, maxVisibleX) {
-    const total = ghosts.length;
-    if (total === 0) return;
-
-    // Cap rendered ghosts at GHOST_RENDER_CAP (older ones still simulated their craters)
-    const startIdx = Math.max(0, total - GHOST_RENDER_CAP);
-    const renderedCount = total - startIdx;
-
-    for (let i = startIdx; i < total; i++) {
-      const g = ghosts[i];
-      if (currentTick > g.deathTick) continue;
-
-      const base = currentTick * 4;
-      const gx = g.frames[base];
-      if (gx < minVisibleX - 120 || gx > maxVisibleX + 120) continue;
-
-      const gy = g.frames[base + 1];
-      const gAngle = g.frames[base + 2];
-      const gThrust = g.frames[base + 3];
-
-      // Older ghosts more faded, newer ghosts brighter
-      const rank = (i - startIdx + 1) / renderedCount;
-      const alpha = 0.14 + 0.42 * rank;
-      const ticksLeft = g.deathTick - currentTick;
-      const warningPulse = ticksLeft < 32 && ((ticksLeft >> 2) & 1) === 0;
-
-      // Faint ghost trail
-      const trailStartTick = Math.max(0, currentTick - 28);
-      if (currentTick > trailStartTick) {
-        ctx.save();
-        ctx.beginPath();
-        for (let t = trailStartTick; t <= currentTick; t += 2) {
-          const tb = t * 4;
-          const tx = g.frames[tb];
-          const ty = g.frames[tb + 1];
-          if (t === trailStartTick) ctx.moveTo(tx, ty);
-          else ctx.lineTo(tx, ty);
-        }
-        ctx.strokeStyle = warningPulse
-          ? `rgba(255, 175, 85, ${alpha * 0.55})`
-          : `rgba(110, 218, 255, ${alpha * 0.45})`;
-        ctx.lineWidth = 1.6;
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      // Imminent detonation ring when ghost is about to blast a crater
-      if (ticksLeft > 0 && ticksLeft <= 30) {
-        const frac = ticksLeft / 30;
-        ctx.save();
-        ctx.beginPath();
-        ctx.arc(g.deathX, g.deathY, CRATER_RADIUS * (0.35 + frac * 0.65), 0, Math.PI * 2);
-        ctx.strokeStyle = `rgba(255, 155, 70, ${(1 - frac) * 0.55})`;
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      drawRocketShape(gx, gy, gAngle, gThrust, true, alpha, warningPulse);
-    }
-  }
-
-  function renderParticles(minVisibleX, maxVisibleX) {
-    // Flashes & shockwaves
-    for (let i = 0; i < MAX_FLASHES; i++) {
-      if (flashLife[i] <= 0) continue;
-      const fx = flashX[i];
-      if (fx < minVisibleX - 150 || fx > maxVisibleX + 150) continue;
-      const fy = flashY[i];
-      const t = flashLife[i] / flashMaxLife[i];
-      const rad = flashRadius[i] * (1.25 - t * 0.45);
-      const isGhost = flashGhost[i] === 1;
-
-      const grad = ctx.createRadialGradient(fx, fy, 2, fx, fy, rad);
-      if (isGhost) {
-        grad.addColorStop(0, `rgba(255, 245, 215, ${t * 0.75})`);
-        grad.addColorStop(0.45, `rgba(255, 165, 80, ${t * 0.45})`);
-        grad.addColorStop(1, 'rgba(255, 110, 40, 0)');
-      } else {
-        grad.addColorStop(0, `rgba(255, 252, 225, ${t * 0.92})`);
-        grad.addColorStop(0.4, `rgba(255, 140, 45, ${t * 0.65})`);
-        grad.addColorStop(1, 'rgba(220, 50, 25, 0)');
-      }
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(fx, fy, rad, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    // Particles
-    for (let i = 0; i < MAX_PARTICLES; i++) {
-      if (partLife[i] <= 0) continue;
-      const px = partX[i];
-      if (px < minVisibleX - 50 || px > maxVisibleX + 50) continue;
-      const py = partY[i];
-      const t = partLife[i] / partMaxLife[i];
-      const sz = partSize[i] * (0.4 + 0.6 * t);
-      const type = partType[i];
-
-      if (type === 0) {
-        // Exhaust particle: bright yellow-white cooling to warm orange-red
-        if (t > 0.65) ctx.fillStyle = `rgba(255, 242, 185, ${t})`;
-        else if (t > 0.3) ctx.fillStyle = `rgba(255, 138, 42, ${t * 0.9})`;
-        else ctx.fillStyle = `rgba(180, 62, 48, ${t * 0.75})`;
-      } else if (type === 1) {
-        // Player explosion spark
-        ctx.fillStyle = t > 0.5
-          ? `rgba(255, 228, 140, ${t})`
-          : `rgba(242, 92, 38, ${t})`;
-      } else if (type === 2) {
-        // Carved rock debris
-        ctx.fillStyle = `rgba(98, 118, 148, ${t * 0.9})`;
-      } else {
-        // Ghost explosion spark
-        ctx.fillStyle = t > 0.5
-          ? `rgba(205, 245, 255, ${t * 0.9})`
-          : `rgba(255, 152, 68, ${t * 0.85})`;
-      }
-
-      ctx.beginPath();
-      ctx.arc(px, py, sz, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  function renderStartAndFinishProps(minVisibleX, maxVisibleX) {
-    // Launch pad in start zone
-    if (START_X >= minVisibleX - 80 && START_X <= maxVisibleX + 80) {
-      const startGx = Math.round(START_X / CELL_SIZE);
-      const padY = centerlineY[startGx] + 10;
-
-      ctx.fillStyle = '#2d3b52';
-      ctx.fillRect(START_X - 24, padY, 48, 5);
-      ctx.fillStyle = '#38bdf8';
-      ctx.fillRect(START_X - 18, padY + 1, 36, 2);
-
-      // Subtle guide chevrons pointing into the tunnel
-      const pulse = 0.25 + 0.15 * Math.sin(performance.now() * 0.004);
-      ctx.strokeStyle = `rgba(100, 200, 255, ${pulse})`;
-      ctx.lineWidth = 2;
-      for (let k = 0; k < 3; k++) {
-        const cx = START_X + 75 + k * 22;
-        const cy = centerlineY[startGx];
-        ctx.beginPath();
-        ctx.moveTo(cx - 6, cy - 8);
-        ctx.lineTo(cx + 2, cy);
-        ctx.lineTo(cx - 6, cy + 8);
-        ctx.stroke();
-      }
-    }
-
-    // Finish line laser gate
-    if (FINISH_X >= minVisibleX - 100 && FINISH_X <= maxVisibleX + 100) {
-      const finGrad = ctx.createLinearGradient(FINISH_X - 25, 0, FINISH_X + 25, 0);
-      finGrad.addColorStop(0, 'rgba(56, 239, 125, 0)');
-      finGrad.addColorStop(0.5, 'rgba(56, 239, 125, 0.26)');
-      finGrad.addColorStop(1, 'rgba(56, 239, 125, 0)');
-      ctx.fillStyle = finGrad;
-      ctx.fillRect(FINISH_X - 25, 0, 50, WORLD_HEIGHT);
-
-      // Dashed energy line
-      ctx.save();
-      ctx.strokeStyle = '#4ade80';
-      ctx.lineWidth = 2.5;
-      ctx.setLineDash([12, 10]);
-      ctx.lineDashOffset = -performance.now() * 0.04;
-      ctx.beginPath();
-      ctx.moveTo(FINISH_X, 0);
-      ctx.lineTo(FINISH_X, WORLD_HEIGHT);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  function renderHUD() {
-    const pad = 18;
-    ctx.save();
-
-    // Top-left stats: ATTEMPT, GHOSTS, BEST
-    ctx.font = '600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-
-    ctx.fillStyle = 'rgba(148, 168, 198, 0.85)';
-    ctx.fillText('ATTEMPT', pad, 26);
-    ctx.fillStyle = '#f8fafc';
-    ctx.font = '700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-    ctx.fillText(String(attemptCount), pad + 70, 26);
-
-    ctx.font = '600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-    ctx.fillStyle = 'rgba(148, 168, 198, 0.85)';
-    ctx.fillText('GHOSTS', pad + 112, 26);
-    ctx.fillStyle = '#7ce2ff';
-    ctx.font = '700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-    ctx.fillText(String(ghosts.length), pad + 174, 26);
-
-    if (sessionBestAttempts !== null) {
-      ctx.font = '600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = 'rgba(148, 168, 198, 0.85)';
-      ctx.fillText('BEST', pad + 216, 26);
-      ctx.fillStyle = '#4ade80';
-      ctx.font = '700 16px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillText(String(sessionBestAttempts), pad + 256, 26);
-    }
-
-    // Thin progress bar showing distance to finish + furthest ghost marker
-    const barW = Math.min(360, Math.max(140, screenW - 360));
-    const barH = 5;
-    const barX = (screenW > 640) ? (screenW - barW) * 0.5 : pad;
-    const barY = (screenW > 640) ? 24 : 50;
-
-    // Background track
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
-    ctx.beginPath();
-    ctx.roundRect(barX, barY, barW, barH, 3);
-    ctx.fill();
-
-    // Player progress fill
-    const progress = Math.max(0, Math.min(1, (rocket.x - START_X) / TUNNEL_LENGTH));
-    if (progress > 0) {
-      const grad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
-      grad.addColorStop(0, '#ff7b29');
-      grad.addColorStop(1, '#ffd166');
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.roundRect(barX, barY, Math.max(4, barW * progress), barH, 3);
-      ctx.fill();
-    }
-
-    // Furthest ghost death marker on the progress bar
-    if (ghosts.length > 0 && furthestGhostX > START_X) {
-      const ghostProg = Math.max(0, Math.min(1, (furthestGhostX - START_X) / TUNNEL_LENGTH));
-      const mx = barX + barW * ghostProg;
-      ctx.fillStyle = '#7ce2ff';
-      ctx.fillRect(mx - 1, barY - 4, 2, barH + 8);
-
-      ctx.beginPath();
-      ctx.moveTo(mx, barY - 4);
-      ctx.lineTo(mx - 4, barY - 9);
-      ctx.lineTo(mx + 4, barY - 9);
-      ctx.closePath();
-      ctx.fill();
-    }
-
-    // Mute toggle button (top-right)
-    muteBtnRect.w = 88;
-    muteBtnRect.h = 30;
-    muteBtnRect.x = screenW - muteBtnRect.w - pad;
-    muteBtnRect.y = 11;
-
-    ctx.fillStyle = 'rgba(20, 28, 42, 0.78)';
-    ctx.strokeStyle = 'rgba(120, 148, 185, 0.35)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.roundRect(muteBtnRect.x, muteBtnRect.y, muteBtnRect.w, muteBtnRect.h, 6);
-    ctx.fill();
-    ctx.stroke();
-
-    // Vector speaker icon
-    const sx = muteBtnRect.x + 14;
-    const sy = muteBtnRect.y + 15;
-    ctx.fillStyle = sound.muted ? '#64748b' : '#cbd5e1';
-    ctx.beginPath();
-    ctx.moveTo(sx, sy - 3);
-    ctx.lineTo(sx + 4, sy - 3);
-    ctx.lineTo(sx + 9, sy - 7);
-    ctx.lineTo(sx + 9, sy + 7);
-    ctx.lineTo(sx + 4, sy + 3);
-    ctx.lineTo(sx, sy + 3);
-    ctx.closePath();
-    ctx.fill();
-
-    if (!sound.muted) {
-      ctx.strokeStyle = '#7ce2ff';
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.arc(sx + 10, sy, 4, -0.7, 0.7);
-      ctx.stroke();
-    } else {
-      ctx.strokeStyle = '#ef4444';
-      ctx.lineWidth = 1.6;
-      ctx.beginPath();
-      ctx.moveTo(sx + 12, sy - 4);
-      ctx.lineTo(sx + 18, sy + 4);
-      ctx.moveTo(sx + 18, sy - 4);
-      ctx.lineTo(sx + 12, sy + 4);
-      ctx.stroke();
-    }
-
-    ctx.font = '600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillStyle = sound.muted ? '#94a3b8' : '#e2e8f0';
-    ctx.fillText(sound.muted ? 'MUTED' : 'SOUND', sx + 22, sy + 0.5);
-
-    ctx.restore();
-  }
-
-  function renderOverlays() {
-    if (gameState === 'START') {
-      ctx.save();
-      ctx.fillStyle = 'rgba(9, 13, 21, 0.62)';
-      ctx.fillRect(0, 0, screenW, screenH);
-
-      const cx = screenW * 0.5;
-      const cy = screenH * 0.5;
-
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-
-      ctx.font = '800 42px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = '#f8fafc';
-      ctx.fillText('BLAST ECHO', cx, cy - 42);
-
-      ctx.font = '500 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = '#94a3b8';
-      ctx.fillText('Every crash carves a crater. Follow your ghosts to blast through.', cx, cy + 2);
-
-      const pulse = 0.65 + 0.35 * Math.sin(performance.now() * 0.005);
-      ctx.font = '700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = `rgba(255, 145, 66, ${pulse})`;
-      ctx.fillText('TAP TO LAUNCH', cx, cy + 52);
-
-      ctx.restore();
-    } else if (gameState === 'CLEARED') {
-      ctx.save();
-      ctx.fillStyle = 'rgba(9, 13, 21, 0.68)';
-      ctx.fillRect(0, 0, screenW, screenH);
-
-      const cx = screenW * 0.5;
-      const cy = screenH * 0.5;
-
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-
-      ctx.font = '800 36px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = '#4ade80';
-      ctx.fillText('TUNNEL CLEARED', cx, cy - 44);
-
-      ctx.font = '600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = '#f8fafc';
-      ctx.fillText(`ATTEMPTS USED: ${attemptCount}`, cx, cy + 2);
-
-      ctx.font = '600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = '#7ce2ff';
-      ctx.fillText(`SESSION BEST: ${sessionBestAttempts}`, cx, cy + 32);
-
-      ctx.font = '500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = '#94a3b8';
-      ctx.fillText('GENERATING NEW TUNNEL...', cx, cy + 68);
-
-      ctx.restore();
-    }
-  }
-
-  function renderFrame(frameDt) {
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    // Compute world-to-screen scale so the tunnel fits vertically and always shows good horizontal lookahead
-    const scale = Math.min(screenH / WORLD_HEIGHT, screenW / 660);
-    const viewWorldW = screenW / scale;
-    const offsetY = (screenH - WORLD_HEIGHT * scale) * 0.5;
-
-    // Smooth horizontal camera follow
-    const targetCamX = Math.max(0, Math.min(WORLD_WIDTH - viewWorldW, rocket.x - viewWorldW * 0.28));
-    camX += (targetCamX - camX) * (1 - Math.exp(-10 * frameDt));
-
-    // Screen shake decay
-    if (shakeMag > 0.1) {
-      shakeX = (Math.random() - 0.5) * 2 * shakeMag;
-      shakeY = (Math.random() - 0.5) * 2 * shakeMag;
-      shakeMag *= Math.exp(-14 * frameDt);
-    } else {
-      shakeMag = 0;
-      shakeX = 0;
-      shakeY = 0;
-    }
-
-    // Fill outer letterbox / deep cave backdrop
-    ctx.fillStyle = '#121722';
-    ctx.fillRect(0, 0, screenW, screenH);
-
-    ctx.save();
-    ctx.translate(shakeX, offsetY + shakeY);
-    ctx.scale(scale, scale);
-
-    // Rich cave interior gradient background
-    const bgGrad = ctx.createLinearGradient(0, 0, 0, WORLD_HEIGHT);
-    bgGrad.addColorStop(0, '#070a10');
-    bgGrad.addColorStop(0.5, '#0d131f');
-    bgGrad.addColorStop(1, '#070a10');
-    ctx.fillStyle = bgGrad;
-    ctx.fillRect(0, 0, viewWorldW, WORLD_HEIGHT);
-
-    // Subtle parallax background rock ribs in the deep cave
-    ctx.fillStyle = 'rgba(22, 30, 46, 0.55)';
-    const parallaxOffset = -(camX * 0.35) % 180;
-    for (let px = parallaxOffset - 180; px < viewWorldW + 180; px += 180) {
-      ctx.fillRect(px, 0, 52, WORLD_HEIGHT);
-    }
-
-    // Translate into world coordinates
-    ctx.translate(-camX, 0);
-
-    const minVisibleX = camX;
-    const maxVisibleX = camX + viewWorldW;
-
-    renderStartAndFinishProps(minVisibleX, maxVisibleX);
-
-    // Draw ONLY the visible slice of the offscreen terrain canvas
-    const srcX = Math.max(0, Math.floor((minVisibleX / CELL_SIZE) * SUB_PX) - 2);
-    const srcRight = Math.min(OFFSCREEN_W, Math.ceil((maxVisibleX / CELL_SIZE) * SUB_PX) + 2);
-    const srcW = Math.max(1, srcRight - srcX);
-    const dstX = (srcX / SUB_PX) * CELL_SIZE;
-    const dstW = (srcW / SUB_PX) * CELL_SIZE;
-
-    ctx.drawImage(
-      activeTerrainCanvas,
-      srcX, 0, srcW, OFFSCREEN_H,
-      dstX, 0, dstW, WORLD_HEIGHT
-    );
-
-    // Draw ghosts & their trails
-    renderGhosts(minVisibleX, maxVisibleX);
-
-    // Draw player rocket if alive
-    if (gameState === 'PLAYING' || gameState === 'START' || gameState === 'CLEARED') {
-      drawRocketShape(rocket.x, rocket.y, rocket.angle, rocket.thrust, false, 1.0, false);
-    }
-
-    // Draw exhaust & explosion particles
-    renderParticles(minVisibleX, maxVisibleX);
-
-    ctx.restore();
-
-    // Screen-space HUD and state overlays
-    renderHUD();
-    renderOverlays();
-  }
-
-  // ============================================================================
-  // INPUT HANDLING & VISIBILITY PAUSE
-  // ============================================================================
-  function handlePressStart() {
-    sound.init();
-    if (gameState === 'START') {
-      inputHeld = true;
-      startAttempt();
-      return;
-    }
-    if (gameState === 'CLEARED' && stateTimer < 1.8) {
-      inputHeld = true;
-      startNewTunnel((currentSeed + 0x9E3779B9) >>> 0);
-      return;
-    }
-    inputHeld = true;
-  }
-
-  function handlePressEnd() {
-    inputHeld = false;
-  }
-
-  canvas.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    // Check mute button hit
-    if (
-      x >= muteBtnRect.x &&
-      x <= muteBtnRect.x + muteBtnRect.w &&
-      y >= muteBtnRect.y &&
-      y <= muteBtnRect.y + muteBtnRect.h
-    ) {
-      sound.toggleMute();
-      return;
-    }
-
-    handlePressStart();
-  }, { passive: false });
-
-  window.addEventListener('pointerup', (e) => {
-    e.preventDefault();
-    handlePressEnd();
-  }, { passive: false });
-
-  window.addEventListener('pointercancel', () => {
-    handlePressEnd();
-  });
-
-  window.addEventListener('keydown', (e) => {
-    if (e.code === 'Space') {
-      e.preventDefault();
-      if (!e.repeat) handlePressStart();
-    } else if (e.code === 'KeyM') {
-      sound.toggleMute();
-    }
-  });
-
-  window.addEventListener('keyup', (e) => {
-    if (e.code === 'Space') {
-      e.preventDefault();
-      handlePressEnd();
-    }
-  });
-
-  // Prevent touch scrolling or pinch-zooming anywhere
-  document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
-
-  // Pause when tab is hidden
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      paused = true;
-      inputHeld = false;
-      sound.setThrust(0);
-    } else {
-      paused = false;
-      lastFrameTime = performance.now();
-    }
-  });
-
-  // ============================================================================
-  // MAIN LOOP (FIXED-TIMESTEP 120 HZ ACCUMULATOR)
-  // ============================================================================
-  generateTunnel(currentSeed);
-  resetRocketToStart();
-
-  let lastFrameTime = performance.now();
-
-  function loop(now) {
-    requestAnimationFrame(loop);
-    if (paused) return;
-
-    let frameDt = (now - lastFrameTime) / 1000;
-    lastFrameTime = now;
-    if (frameDt > 0.1) frameDt = 0.1;
-
-    if (gameState === 'PLAYING' || gameState === 'DEAD') {
-      accumulator += frameDt;
-      while (accumulator >= FIXED_DT) {
-        stepPhysicsTick();
-        accumulator -= FIXED_DT;
-      }
-    }
-
-    if (gameState === 'DEAD') {
-      stateTimer -= frameDt;
-      if (stateTimer <= 0) {
-        attemptCount++;
-        startAttempt();
-      }
-    } else if (gameState === 'CLEARED') {
-      stateTimer -= frameDt;
-      if (stateTimer <= 0) {
-        startNewTunnel((currentSeed + 0x9E3779B9) >>> 0);
-      }
-    }
-
-    updateVisualEffects(frameDt);
-    renderFrame(frameDt);
-  }
-
-  requestAnimationFrame(loop);
-})();
-</script>
-</body>
+    <head>
+        <meta charset="UTF-8" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+        />
+        <title>BLAST ECHO</title>
+        <style>
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+                user-select: none;
+                -webkit-user-select: none;
+                -webkit-touch-callout: none;
+            }
+            html,
+            body {
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+                background-color: #0b0e15;
+                font-family:
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                    Helvetica, Arial, sans-serif;
+                touch-action: none;
+            }
+            canvas {
+                display: block;
+                width: 100%;
+                height: 100%;
+                touch-action: none;
+                cursor: pointer;
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="gameCanvas"></canvas>
+        <script>
+            (() => {
+                "use strict";
+
+                // ============================================================================
+                // TUNABLE GAME CONSTANTS
+                // ============================================================================
+                const FIXED_DT = 1 / 120; // 120 Hz deterministic simulation step
+                const GRAVITY = 250; // Constant downward gravity (px/s^2)
+                const THRUST_POWER = 640; // Max thruster acceleration along nose (px/s^2)
+                const THRUST_RAMP_UP = 1 / 0.12; // ~120 ms ramp from 0 to full thrust
+                const THRUST_RAMP_DOWN = 1 / 0.11; // ~110 ms ramp from full thrust to 0
+                const VELOCITY_DAMPING = 0.9925; // Light velocity damping per 120 Hz tick
+                const MAX_SPEED = 275; // Maximum rocket speed clamp (px/s)
+                const ROT_EASE_THRUST = 22.0; // Rotation easing speed while firing thruster
+                const ROT_EASE_COAST = 9.5; // Rotation easing speed while coasting
+
+                const CELL_SIZE = 4; // Destructible terrain cell size (world px)
+                const CRATER_RADIUS = 42; // Crater radius (tuned so 3-6 blasts open a pinch)
+                const TUNNEL_LENGTH = 5200; // Classic Mode distance to finish line (~7 screens)
+                const GHOST_RENDER_CAP = 25; // Max rendered ghosts (older ones still carve craters)
+                const RESPAWN_DELAY = 0.7; // Auto-restart delay after death (seconds)
+
+                // World & streaming chunk dimensions
+                const START_X = 240;
+                const FINISH_X = START_X + TUNNEL_LENGTH;
+                const CLASSIC_WORLD_WIDTH = FINISH_X + 440;
+                const WORLD_HEIGHT = 720;
+                const GRID_H = Math.floor(WORLD_HEIGHT / CELL_SIZE); // 180 cells tall
+
+                // Terrain is divided into 256-cell (1024px) horizontal chunks for infinite Endless streaming
+                const CHUNK_SHIFT = 8;
+                const CHUNK_W = 1 << CHUNK_SHIFT; // 256 cells = 1024 world px per chunk
+                const CHUNK_MASK = CHUNK_W - 1;
+                const SUB_PX = 2; // 2x2 subpixel bevel rendering per terrain cell
+                const CHUNK_CANVAS_W = CHUNK_W * SUB_PX;
+                const CHUNK_CANVAS_H = GRID_H * SUB_PX;
+                const CLASSIC_MAX_GX = Math.floor(
+                    CLASSIC_WORLD_WIDTH / CELL_SIZE,
+                );
+
+                // Rocket hull collision sample offsets (local rocket space: +x nose, +y belly)
+                const HULL_POINTS = [
+                    [14, 0],
+                    [7, -6],
+                    [7, 6],
+                    [-2, -7],
+                    [-2, 7],
+                    [-11, -7],
+                    [-11, 7],
+                    [-13, 0],
+                ];
+
+                // ============================================================================
+                // SEEDED PRNG & HIGH-ENTROPY SESSION SEED GENERATOR
+                // ============================================================================
+                function mulberry32(seed) {
+                    let a = seed >>> 0;
+                    return function () {
+                        a = (a + 0x6d2b79f5) >>> 0;
+                        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+                        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+                        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+                    };
+                }
+
+                function hashInt(seed, n) {
+                    let h = (seed ^ Math.imul(n, 0x9e3779b9)) >>> 0;
+                    h ^= h >>> 16;
+                    h = Math.imul(h, 0x85ebca6b) >>> 0;
+                    h ^= h >>> 13;
+                    h = Math.imul(h, 0xc2b2ae35) >>> 0;
+                    h ^= h >>> 16;
+                    return (h >>> 0) / 4294967296;
+                }
+
+                function generateSessionSeed() {
+                    if (window.crypto && window.crypto.getRandomValues) {
+                        const buf = new Uint32Array(1);
+                        window.crypto.getRandomValues(buf);
+                        if (buf[0] !== 0) return buf[0] >>> 0;
+                    }
+                    return (
+                        ((Date.now() & 0xffffffff) ^
+                            Math.floor(Math.random() * 0xffffffff)) >>>
+                        0
+                    );
+                }
+
+                function formatSeedCode(seed) {
+                    return (seed >>> 0)
+                        .toString(16)
+                        .toUpperCase()
+                        .padStart(8, "0")
+                        .slice(0, 6);
+                }
+
+                // ============================================================================
+                // WEBAUDIO SYNTHESIZED SOUND SYSTEM
+                // ============================================================================
+                const sound = {
+                    ctx: null,
+                    muted: false,
+                    initialized: false,
+                    thrustGain: null,
+                    thrustFilter: null,
+                    subOsc: null,
+                    subGain: null,
+                    noiseBuffer: null,
+
+                    init() {
+                        if (this.initialized) {
+                            if (this.ctx && this.ctx.state === "suspended") {
+                                this.ctx.resume();
+                            }
+                            return;
+                        }
+                        const AudioCtx =
+                            window.AudioContext || window.webkitAudioContext;
+                        if (!AudioCtx) return;
+
+                        this.ctx = new AudioCtx();
+                        this.initialized = true;
+
+                        const sampleRate = this.ctx.sampleRate;
+                        const length = sampleRate * 2;
+                        this.noiseBuffer = this.ctx.createBuffer(
+                            1,
+                            length,
+                            sampleRate,
+                        );
+                        const data = this.noiseBuffer.getChannelData(0);
+                        let b0 = 0,
+                            b1 = 0,
+                            b2 = 0;
+                        for (let i = 0; i < length; i++) {
+                            const white = Math.random() * 2 - 1;
+                            b0 = 0.997 * b0 + white * 0.029;
+                            b1 = 0.985 * b1 + white * 0.032;
+                            b2 = 0.95 * b2 + white * 0.048;
+                            data[i] = (b0 + b1 + b2 + white * 0.18) * 0.5;
+                        }
+
+                        const noiseSource = this.ctx.createBufferSource();
+                        noiseSource.buffer = this.noiseBuffer;
+                        noiseSource.loop = true;
+
+                        this.thrustFilter = this.ctx.createBiquadFilter();
+                        this.thrustFilter.type = "bandpass";
+                        this.thrustFilter.frequency.value = 220;
+                        this.thrustFilter.Q.value = 0.9;
+
+                        this.thrustGain = this.ctx.createGain();
+                        this.thrustGain.gain.value = 0.0001;
+
+                        noiseSource.connect(this.thrustFilter);
+                        this.thrustFilter.connect(this.thrustGain);
+                        this.thrustGain.connect(this.ctx.destination);
+                        noiseSource.start();
+
+                        this.subOsc = this.ctx.createOscillator();
+                        this.subOsc.type = "sawtooth";
+                        this.subOsc.frequency.value = 58;
+
+                        const subFilter = this.ctx.createBiquadFilter();
+                        subFilter.type = "lowpass";
+                        subFilter.frequency.value = 130;
+
+                        this.subGain = this.ctx.createGain();
+                        this.subGain.gain.value = 0.0001;
+
+                        this.subOsc.connect(subFilter);
+                        subFilter.connect(this.subGain);
+                        this.subGain.connect(this.ctx.destination);
+                        this.subOsc.start();
+                    },
+
+                    setThrust(level) {
+                        if (!this.initialized || !this.ctx) return;
+                        const now = this.ctx.currentTime;
+                        const activeLevel = this.muted || paused ? 0 : level;
+                        const targetGain = activeLevel * 0.22;
+                        const targetSub = activeLevel * 0.09;
+                        const targetFreq = 180 + activeLevel * 520;
+                        const targetSubFreq = 52 + activeLevel * 34;
+
+                        this.thrustGain.gain.setTargetAtTime(
+                            Math.max(0.0001, targetGain),
+                            now,
+                            0.025,
+                        );
+                        this.subGain.gain.setTargetAtTime(
+                            Math.max(0.0001, targetSub),
+                            now,
+                            0.025,
+                        );
+                        this.thrustFilter.frequency.setTargetAtTime(
+                            targetFreq,
+                            now,
+                            0.03,
+                        );
+                        this.subOsc.frequency.setTargetAtTime(
+                            targetSubFreq,
+                            now,
+                            0.03,
+                        );
+                    },
+
+                    playExplosion(intensity = 1.0, isGhost = false) {
+                        if (
+                            !this.initialized ||
+                            !this.ctx ||
+                            this.muted ||
+                            intensity <= 0.04
+                        )
+                            return;
+                        const now = this.ctx.currentTime;
+                        const dur = isGhost ? 0.34 : 0.52;
+
+                        const src = this.ctx.createBufferSource();
+                        src.buffer = this.noiseBuffer;
+
+                        const filter = this.ctx.createBiquadFilter();
+                        filter.type = "lowpass";
+                        filter.frequency.setValueAtTime(
+                            isGhost ? 520 : 820,
+                            now,
+                        );
+                        filter.frequency.exponentialRampToValueAtTime(
+                            55,
+                            now + dur,
+                        );
+
+                        const gain = this.ctx.createGain();
+                        const peak =
+                            (isGhost ? 0.24 : 0.45) * Math.min(1, intensity);
+                        gain.gain.setValueAtTime(peak, now);
+                        gain.gain.exponentialRampToValueAtTime(
+                            0.001,
+                            now + dur,
+                        );
+
+                        src.connect(filter);
+                        filter.connect(gain);
+                        gain.connect(this.ctx.destination);
+                        src.start(now);
+                        src.stop(now + dur);
+
+                        const osc = this.ctx.createOscillator();
+                        osc.type = "sine";
+                        osc.frequency.setValueAtTime(isGhost ? 110 : 145, now);
+                        osc.frequency.exponentialRampToValueAtTime(
+                            24,
+                            now + dur * 0.85,
+                        );
+
+                        const oscGain = this.ctx.createGain();
+                        oscGain.gain.setValueAtTime(peak * 0.85, now);
+                        oscGain.gain.exponentialRampToValueAtTime(
+                            0.001,
+                            now + dur * 0.85,
+                        );
+
+                        osc.connect(oscGain);
+                        oscGain.connect(this.ctx.destination);
+                        osc.start(now);
+                        osc.stop(now + dur * 0.85);
+                    },
+
+                    playWin() {
+                        if (!this.initialized || !this.ctx || this.muted)
+                            return;
+                        const now = this.ctx.currentTime;
+                        const notes = [261.63, 329.63, 392.0, 523.25];
+                        for (let i = 0; i < notes.length; i++) {
+                            const osc = this.ctx.createOscillator();
+                            const gain = this.ctx.createGain();
+                            osc.type = "triangle";
+                            osc.frequency.setValueAtTime(
+                                notes[i],
+                                now + i * 0.08,
+                            );
+                            gain.gain.setValueAtTime(0.001, now + i * 0.08);
+                            gain.gain.linearRampToValueAtTime(
+                                0.14,
+                                now + i * 0.08 + 0.03,
+                            );
+                            gain.gain.exponentialRampToValueAtTime(
+                                0.0008,
+                                now + i * 0.08 + 0.55,
+                            );
+                            osc.connect(gain);
+                            gain.connect(this.ctx.destination);
+                            osc.start(now + i * 0.08);
+                            osc.stop(now + i * 0.08 + 0.56);
+                        }
+                    },
+
+                    playClick() {
+                        if (!this.initialized || !this.ctx || this.muted)
+                            return;
+                        const now = this.ctx.currentTime;
+                        const osc = this.ctx.createOscillator();
+                        const gain = this.ctx.createGain();
+                        osc.type = "sine";
+                        osc.frequency.setValueAtTime(520, now);
+                        osc.frequency.exponentialRampToValueAtTime(
+                            260,
+                            now + 0.045,
+                        );
+                        gain.gain.setValueAtTime(0.08, now);
+                        gain.gain.exponentialRampToValueAtTime(
+                            0.001,
+                            now + 0.045,
+                        );
+                        osc.connect(gain);
+                        gain.connect(this.ctx.destination);
+                        osc.start(now);
+                        osc.stop(now + 0.05);
+                    },
+
+                    toggleMute() {
+                        this.init();
+                        this.muted = !this.muted;
+                        if (this.muted) this.setThrust(0);
+                    },
+                };
+
+                // ============================================================================
+                // CHUNKED DESTRUCTIBLE TERRAIN ENGINE (SUPPORTS CLASSIC & INFINITE ENDLESS)
+                // ============================================================================
+                let currentSeed = generateSessionSeed();
+                let gameMode = "CLASSIC"; // 'CLASSIC' or 'ENDLESS'
+
+                // Seed-derived wave parameters
+                let waveParams = null;
+                const chunks = [];
+
+                // Shared pre-allocated ImageData buffers for zero-allocation chunk & crater updates
+                const scratchCanvas = document.createElement("canvas");
+                scratchCanvas.width = CHUNK_CANVAS_W;
+                scratchCanvas.height = CHUNK_CANVAS_H;
+                const scratchCtx = scratchCanvas.getContext("2d");
+                const chunkImageData = scratchCtx.createImageData(
+                    CHUNK_CANVAS_W,
+                    CHUNK_CANVAS_H,
+                );
+                const chunkPixels32 = new Uint32Array(
+                    chunkImageData.data.buffer,
+                );
+
+                const PATCH_CELLS = 44;
+                const PATCH_PX = PATCH_CELLS * SUB_PX;
+                const patchImageData = scratchCtx.createImageData(
+                    PATCH_PX,
+                    PATCH_PX,
+                );
+                const patchPixels32 = new Uint32Array(
+                    patchImageData.data.buffer,
+                );
+
+                function packRGBA(r, g, b, a) {
+                    return (
+                        ((a & 255) << 24) |
+                        ((b & 255) << 16) |
+                        ((g & 255) << 8) |
+                        (r & 255)
+                    );
+                }
+
+                const COL_EMPTY = 0x00000000;
+                const COL_ROCK_DEEP_A = packRGBA(18, 23, 34, 255);
+                const COL_ROCK_DEEP_B = packRGBA(22, 28, 41, 255);
+                const COL_ROCK_DEEP_C = packRGBA(15, 19, 29, 255);
+                const COL_ROCK_MID = packRGBA(42, 54, 74, 255);
+                const COL_ROCK_EDGE = packRGBA(94, 118, 152, 255);
+                const COL_SCORCH_MID = packRGBA(78, 46, 44, 255);
+                const COL_SCORCH_EDGE = packRGBA(218, 116, 62, 255);
+
+                function initTunnelParameters(seed) {
+                    const rng = mulberry32(seed);
+                    waveParams = {
+                        seed,
+                        p1: rng() * Math.PI * 2,
+                        p2: rng() * Math.PI * 2,
+                        p3: rng() * Math.PI * 2,
+                        f1: 0.0016 + rng() * 0.0005,
+                        f2: 0.0041 + rng() * 0.0009,
+                        f3: 0.0095 + rng() * 0.002,
+                        wp1: rng() * 10,
+                        wp2: rng() * 10,
+                        wp3: rng() * 10,
+                        wp4: rng() * 10,
+                    };
+                    chunks.length = 0;
+                }
+
+                // Deterministic pinch point query for zone index z (z >= 0)
+                const PINCH_SPACING = 1180;
+                const FIRST_PINCH_X = START_X + 600;
+
+                function getPinchForZone(z) {
+                    if (z < 0) return null;
+                    if (gameMode === "CLASSIC" && z >= 4) return null;
+                    const jitter =
+                        (hashInt(waveParams.seed, z * 3 + 1) - 0.5) * 110;
+                    const x = FIRST_PINCH_X + z * PINCH_SPACING + jitter;
+                    if (gameMode === "CLASSIC" && x > FINISH_X - 360)
+                        return null;
+
+                    // Plateau widens slightly with depth; capped so 3-6 blasts always open a pinch
+                    const depthStep = Math.min(z, 6);
+                    const plateau = 38 + depthStep * 3.5;
+                    const ramp = 58 + Math.min(z, 4) * 2.5;
+                    return { x, plateau, ramp };
+                }
+
+                function rawCenterlineAt(wx) {
+                    const midY = WORLD_HEIGHT * 0.5;
+                    let env = 1.0;
+                    if (wx < START_X + 260) {
+                        env = Math.max(0, (wx - START_X) / 260);
+                        env = env * env * (3 - 2 * env);
+                    } else if (gameMode === "CLASSIC" && wx > FINISH_X - 300) {
+                        const t = Math.max(
+                            0,
+                            1 - (wx - (FINISH_X - 300)) / 350,
+                        );
+                        env = t * t * (3 - 2 * t);
+                    }
+                    const wave =
+                        Math.sin(wx * waveParams.f1 + waveParams.p1) * 115 +
+                        Math.sin(wx * waveParams.f2 + waveParams.p2) * 52 +
+                        Math.sin(wx * waveParams.f3 + waveParams.p3) * 18;
+                    return midY + wave * env;
+                }
+
+                function getCenterlineYAtWorldX(wx) {
+                    let cy = rawCenterlineAt(wx);
+                    const z = Math.round((wx - FIRST_PINCH_X) / PINCH_SPACING);
+                    const pinch = getPinchForZone(z);
+                    if (pinch) {
+                        const span = pinch.plateau + pinch.ramp;
+                        const dist = Math.abs(wx - pinch.x);
+                        if (dist < span) {
+                            const anchorY = rawCenterlineAt(pinch.x);
+                            const t = 1 - dist / span;
+                            const blend = t * t * (3 - 2 * t) * 0.65;
+                            cy = cy * (1 - blend) + anchorY * blend;
+                        }
+                    }
+                    return cy;
+                }
+
+                // Step 1: Ensure chunk grid cells exist (pure math, no neighbor chunk dependencies)
+                function ensureChunkGrid(chunkIdx) {
+                    if (chunkIdx < 0) return null;
+                    let chunk = chunks[chunkIdx];
+                    if (chunk) return chunk;
+
+                    const pristineGrid = new Uint8Array(CHUNK_W * GRID_H);
+                    const activeGrid = new Uint8Array(CHUNK_W * GRID_H);
+                    const centerlineY = new Float32Array(CHUNK_W);
+
+                    const baseGx = chunkIdx * CHUNK_W;
+                    const { wp1, wp2, wp3, wp4 } = waveParams;
+
+                    for (let lx = 0; lx < CHUNK_W; lx++) {
+                        const gx = baseGx + lx;
+                        const wx = (gx + 0.5) * CELL_SIZE;
+                        const cy = getCenterlineYAtWorldX(wx);
+                        centerlineY[lx] = cy;
+
+                        // Solid back wall behind start zone
+                        if (wx < 90) {
+                            for (let gy = 0; gy < GRID_H; gy++) {
+                                pristineGrid[gy * CHUNK_W + lx] = 3;
+                            }
+                            continue;
+                        }
+
+                        // Base half-width of the cave
+                        let halfGap =
+                            86 +
+                            Math.sin(wx * 0.0032 + wp1) * 16 +
+                            Math.cos(wx * 0.0075 + wp2) * 9;
+
+                        // Roomy start bay
+                        if (wx < START_X + 200) {
+                            const startBlend = Math.max(
+                                0,
+                                1 - Math.max(0, wx - START_X) / 200,
+                            );
+                            halfGap =
+                                halfGap * (1 - startBlend) + 118 * startBlend;
+                            if (wx < 140) {
+                                const capT = (wx - 90) / 50;
+                                halfGap *= Math.sqrt(Math.max(0, capT));
+                            }
+                        }
+
+                        // Wide finish cavern in Classic Mode
+                        if (gameMode === "CLASSIC" && wx > FINISH_X - 220) {
+                            const finBlend = Math.min(
+                                1,
+                                (wx - (FINISH_X - 220)) / 220,
+                            );
+                            halfGap = halfGap * (1 - finBlend) + 135 * finBlend;
+                        }
+
+                        // Pinch point narrowing
+                        let pinchStrength = 0;
+                        const z = Math.round(
+                            (wx - FIRST_PINCH_X) / PINCH_SPACING,
+                        );
+                        const pinch = getPinchForZone(z);
+                        if (pinch) {
+                            const adx = Math.abs(wx - pinch.x);
+                            if (adx <= pinch.plateau) {
+                                pinchStrength = 1.0;
+                            } else if (adx < pinch.plateau + pinch.ramp) {
+                                const u = (adx - pinch.plateau) / pinch.ramp;
+                                pinchStrength =
+                                    0.5 + 0.5 * Math.cos(u * Math.PI);
+                            }
+                        }
+
+                        const minSlitHalf = 3.5; // 7px slit (narrower than the 16px rocket)
+                        halfGap =
+                            halfGap * (1 - pinchStrength) +
+                            minSlitHalf * pinchStrength;
+
+                        const roughScale = 1 - pinchStrength * 0.88;
+                        const topRough =
+                            (Math.sin(wx * 0.043 + wp3) * 9 +
+                                Math.sin(wx * 0.11 + wp1) * 5) *
+                            roughScale;
+                        const botRough =
+                            (Math.cos(wx * 0.039 + wp4) * 9 +
+                                Math.cos(wx * 0.105 + wp2) * 5) *
+                            roughScale;
+
+                        const topEdge = cy - halfGap + topRough;
+                        const botEdge = cy + halfGap + botRough;
+
+                        for (let gy = 0; gy < GRID_H; gy++) {
+                            const idx = gy * CHUNK_W + lx;
+                            if (gy < 3 || gy >= GRID_H - 3) {
+                                pristineGrid[idx] = 3; // Indestructible world ceiling/floor
+                            } else {
+                                const wy = (gy + 0.5) * CELL_SIZE;
+                                pristineGrid[idx] =
+                                    wy > topEdge && wy < botEdge ? 0 : 1;
+                            }
+                        }
+                    }
+
+                    activeGrid.set(pristineGrid);
+
+                    chunk = {
+                        index: chunkIdx,
+                        pristineGrid,
+                        activeGrid,
+                        centerlineY,
+                        pristineCanvas: null,
+                        activeCanvas: null,
+                        activeCtx: null,
+                        rendered: false,
+                        dirty: false,
+                    };
+                    chunks[chunkIdx] = chunk;
+                    return chunk;
+                }
+
+                function getPristineCell(globalGx, gy) {
+                    if (globalGx < 0 || gy < 0 || gy >= GRID_H) return 3;
+                    const c = ensureChunkGrid(globalGx >> CHUNK_SHIFT);
+                    return c.pristineGrid[
+                        gy * CHUNK_W + (globalGx & CHUNK_MASK)
+                    ];
+                }
+
+                function getActiveCell(globalGx, gy) {
+                    if (globalGx < 0 || gy < 0 || gy >= GRID_H) return 3;
+                    const c = ensureChunkGrid(globalGx >> CHUNK_SHIFT);
+                    return c.activeGrid[gy * CHUNK_W + (globalGx & CHUNK_MASK)];
+                }
+
+                function computeGlobalCellColor(
+                    getCellFn,
+                    globalGx,
+                    gy,
+                    cellVal,
+                ) {
+                    const u = getCellFn(globalGx, gy - 1);
+                    const d = getCellFn(globalGx, gy + 1);
+                    const l = getCellFn(globalGx - 1, gy);
+                    const r = getCellFn(globalGx + 1, gy);
+
+                    if (u === 0 || d === 0 || l === 0 || r === 0) {
+                        return cellVal === 2 ? COL_SCORCH_EDGE : COL_ROCK_EDGE;
+                    }
+
+                    const u2 = getCellFn(globalGx, gy - 2);
+                    const d2 = getCellFn(globalGx, gy + 2);
+                    const l2 = getCellFn(globalGx - 2, gy);
+                    const r2 = getCellFn(globalGx + 2, gy);
+                    const ul = getCellFn(globalGx - 1, gy - 1);
+                    const ur = getCellFn(globalGx + 1, gy - 1);
+                    const dl = getCellFn(globalGx - 1, gy + 1);
+                    const dr = getCellFn(globalGx + 1, gy + 1);
+
+                    if (
+                        u2 === 0 ||
+                        d2 === 0 ||
+                        l2 === 0 ||
+                        r2 === 0 ||
+                        ul === 0 ||
+                        ur === 0 ||
+                        dl === 0 ||
+                        dr === 0
+                    ) {
+                        return cellVal === 2 ? COL_SCORCH_MID : COL_ROCK_MID;
+                    }
+
+                    const stratum = (gy + ((globalGx * 5) >> 5)) & 7;
+                    if (stratum === 0 || stratum === 1) return COL_ROCK_DEEP_B;
+                    if (stratum === 4) return COL_ROCK_DEEP_C;
+                    return COL_ROCK_DEEP_A;
+                }
+
+                // Step 2: Render chunk offscreen canvases on demand
+                function ensureChunkRendered(chunkIdx) {
+                    if (chunkIdx < 0) return null;
+                    const chunk = ensureChunkGrid(chunkIdx);
+                    if (chunk.rendered) return chunk;
+
+                    // Ensure neighbor grids exist so 2-cell border bevels are seamless
+                    if (chunkIdx > 0) ensureChunkGrid(chunkIdx - 1);
+                    ensureChunkGrid(chunkIdx + 1);
+
+                    const pristineCanvas = document.createElement("canvas");
+                    pristineCanvas.width = CHUNK_CANVAS_W;
+                    pristineCanvas.height = CHUNK_CANVAS_H;
+                    const pristineCtx = pristineCanvas.getContext("2d");
+
+                    const activeCanvas = document.createElement("canvas");
+                    activeCanvas.width = CHUNK_CANVAS_W;
+                    activeCanvas.height = CHUNK_CANVAS_H;
+                    const activeCtx = activeCanvas.getContext("2d");
+
+                    chunkPixels32.fill(COL_EMPTY);
+                    const baseGx = chunkIdx * CHUNK_W;
+                    const pGrid = chunk.pristineGrid;
+
+                    for (let gy = 0; gy < GRID_H; gy++) {
+                        const rowOffset = gy * CHUNK_W;
+                        const py0 = gy * SUB_PX * CHUNK_CANVAS_W;
+                        const py1 = (gy * SUB_PX + 1) * CHUNK_CANVAS_W;
+
+                        for (let lx = 0; lx < CHUNK_W; lx++) {
+                            const val = pGrid[rowOffset + lx];
+                            if (val === 0) continue;
+
+                            const globalGx = baseGx + lx;
+                            const color = computeGlobalCellColor(
+                                getPristineCell,
+                                globalGx,
+                                gy,
+                                val,
+                            );
+                            const u = getPristineCell(globalGx, gy - 1);
+                            const d = getPristineCell(globalGx, gy + 1);
+                            const l = getPristineCell(globalGx - 1, gy);
+                            const r = getPristineCell(globalGx + 1, gy);
+
+                            const px = lx * SUB_PX;
+                            chunkPixels32[py0 + px] =
+                                u === 0 && l === 0 ? COL_EMPTY : color;
+                            chunkPixels32[py0 + px + 1] =
+                                u === 0 && r === 0 ? COL_EMPTY : color;
+                            chunkPixels32[py1 + px] =
+                                d === 0 && l === 0 ? COL_EMPTY : color;
+                            chunkPixels32[py1 + px + 1] =
+                                d === 0 && r === 0 ? COL_EMPTY : color;
+                        }
+                    }
+
+                    pristineCtx.putImageData(chunkImageData, 0, 0);
+                    activeCtx.drawImage(pristineCanvas, 0, 0);
+
+                    chunk.pristineCanvas = pristineCanvas;
+                    chunk.activeCanvas = activeCanvas;
+                    chunk.activeCtx = activeCtx;
+                    chunk.rendered = true;
+                    return chunk;
+                }
+
+                function updateChunkPatch(
+                    chunkIdx,
+                    minLx,
+                    minGy,
+                    maxLx,
+                    maxGy,
+                ) {
+                    const chunk = ensureChunkRendered(chunkIdx);
+                    const wCells = maxLx - minLx + 1;
+                    const hCells = maxGy - minGy + 1;
+                    if (
+                        wCells <= 0 ||
+                        hCells <= 0 ||
+                        wCells > PATCH_CELLS ||
+                        hCells > PATCH_CELLS
+                    )
+                        return;
+
+                    const baseGx = chunkIdx * CHUNK_W;
+                    const aGrid = chunk.activeGrid;
+
+                    for (let ly = 0; ly < hCells; ly++) {
+                        const gy = minGy + ly;
+                        const rowOffset = gy * CHUNK_W;
+                        const py0 = ly * SUB_PX * PATCH_PX;
+                        const py1 = (ly * SUB_PX + 1) * PATCH_PX;
+
+                        for (let lx = 0; lx < wCells; lx++) {
+                            const cellLx = minLx + lx;
+                            const val = aGrid[rowOffset + cellLx];
+                            const px = lx * SUB_PX;
+
+                            if (val === 0) {
+                                patchPixels32[py0 + px] = COL_EMPTY;
+                                patchPixels32[py0 + px + 1] = COL_EMPTY;
+                                patchPixels32[py1 + px] = COL_EMPTY;
+                                patchPixels32[py1 + px + 1] = COL_EMPTY;
+                                continue;
+                            }
+
+                            const globalGx = baseGx + cellLx;
+                            const color = computeGlobalCellColor(
+                                getActiveCell,
+                                globalGx,
+                                gy,
+                                val,
+                            );
+                            const u = getActiveCell(globalGx, gy - 1);
+                            const d = getActiveCell(globalGx, gy + 1);
+                            const l = getActiveCell(globalGx - 1, gy);
+                            const r = getActiveCell(globalGx + 1, gy);
+
+                            patchPixels32[py0 + px] =
+                                u === 0 && l === 0 ? COL_EMPTY : color;
+                            patchPixels32[py0 + px + 1] =
+                                u === 0 && r === 0 ? COL_EMPTY : color;
+                            patchPixels32[py1 + px] =
+                                d === 0 && l === 0 ? COL_EMPTY : color;
+                            patchPixels32[py1 + px + 1] =
+                                d === 0 && r === 0 ? COL_EMPTY : color;
+                        }
+                    }
+
+                    chunk.activeCtx.putImageData(
+                        patchImageData,
+                        minLx * SUB_PX,
+                        minGy * SUB_PX,
+                        0,
+                        0,
+                        wCells * SUB_PX,
+                        hCells * SUB_PX,
+                    );
+                }
+
+                function resetTerrainToPristine() {
+                    for (let i = 0; i < chunks.length; i++) {
+                        const chunk = chunks[i];
+                        if (chunk && chunk.dirty) {
+                            chunk.activeGrid.set(chunk.pristineGrid);
+                            if (chunk.rendered) {
+                                chunk.activeCtx.clearRect(
+                                    0,
+                                    0,
+                                    CHUNK_CANVAS_W,
+                                    CHUNK_CANVAS_H,
+                                );
+                                chunk.activeCtx.drawImage(
+                                    chunk.pristineCanvas,
+                                    0,
+                                    0,
+                                );
+                            }
+                            chunk.dirty = false;
+                        }
+                    }
+                }
+
+                // Carve circular jagged crater across 1 or 2 chunks seamlessly
+                function carveCrater(worldX, worldY) {
+                    const r = CRATER_RADIUS;
+                    const maxR = r + 10;
+                    const minGx = Math.max(
+                        2,
+                        Math.floor((worldX - maxR) / CELL_SIZE),
+                    );
+                    const maxBoundGx =
+                        gameMode === "CLASSIC"
+                            ? CLASSIC_MAX_GX - 3
+                            : 0x7fffffff;
+                    const maxGx = Math.min(
+                        maxBoundGx,
+                        Math.ceil((worldX + maxR) / CELL_SIZE),
+                    );
+                    const minGy = Math.max(
+                        3,
+                        Math.floor((worldY - maxR) / CELL_SIZE),
+                    );
+                    const maxGy = Math.min(
+                        GRID_H - 4,
+                        Math.ceil((worldY + maxR) / CELL_SIZE),
+                    );
+
+                    for (let gy = minGy; gy <= maxGy; gy++) {
+                        const cy = (gy + 0.5) * CELL_SIZE;
+                        const dy = cy - worldY;
+
+                        for (let gx = minGx; gx <= maxGx; gx++) {
+                            const chunkIdx = gx >> CHUNK_SHIFT;
+                            const lx = gx & CHUNK_MASK;
+                            const chunk = ensureChunkRendered(chunkIdx);
+                            const idx = gy * CHUNK_W + lx;
+                            if (chunk.activeGrid[idx] === 3) continue;
+
+                            const cx = (gx + 0.5) * CELL_SIZE;
+                            const dx = cx - worldX;
+                            const dist = Math.hypot(dx, dy);
+
+                            const ang = Math.atan2(dy, dx);
+                            const hash =
+                                (((gx * 374761393) ^ (gy * 668265263)) >>> 0) &
+                                255;
+                            const jag =
+                                Math.sin(ang * 7 + worldX * 0.11) * 3.0 +
+                                Math.cos(ang * 11 - worldY * 0.13) * 2.2 +
+                                (hash / 255 - 0.5) * 3.2;
+                            const effR = r + jag;
+
+                            if (dist <= effR) {
+                                chunk.activeGrid[idx] = 0;
+                                chunk.dirty = true;
+                            } else if (
+                                dist <= effR + CELL_SIZE * 2.3 &&
+                                chunk.activeGrid[idx] === 1
+                            ) {
+                                chunk.activeGrid[idx] = 2;
+                                chunk.dirty = true;
+                            }
+                        }
+                    }
+
+                    // Update affected offscreen canvas patches (including 2-cell bevel margin)
+                    const patchMinGx = Math.max(0, minGx - 2);
+                    const patchMaxGx = maxGx + 2;
+                    const patchMinGy = Math.max(0, minGy - 2);
+                    const patchMaxGy = Math.min(GRID_H - 1, maxGy + 2);
+
+                    const startChunk = patchMinGx >> CHUNK_SHIFT;
+                    const endChunk = patchMaxGx >> CHUNK_SHIFT;
+
+                    for (let c = startChunk; c <= endChunk; c++) {
+                        const cStartGx = c * CHUNK_W;
+                        const localMinLx = Math.max(0, patchMinGx - cStartGx);
+                        const localMaxLx = Math.min(
+                            CHUNK_W - 1,
+                            patchMaxGx - cStartGx,
+                        );
+                        updateChunkPatch(
+                            c,
+                            localMinLx,
+                            patchMinGy,
+                            localMaxLx,
+                            patchMaxGy,
+                        );
+                    }
+                }
+
+                // ============================================================================
+                // ZERO-ALLOCATION PARTICLE & FLASH POOLS
+                // ============================================================================
+                const MAX_PARTICLES = 600;
+                const partX = new Float32Array(MAX_PARTICLES);
+                const partY = new Float32Array(MAX_PARTICLES);
+                const partVx = new Float32Array(MAX_PARTICLES);
+                const partVy = new Float32Array(MAX_PARTICLES);
+                const partLife = new Float32Array(MAX_PARTICLES);
+                const partMaxLife = new Float32Array(MAX_PARTICLES);
+                const partSize = new Float32Array(MAX_PARTICLES);
+                const partType = new Uint8Array(MAX_PARTICLES); // 0=exhaust, 1=spark, 2=debris, 3=ghostBlast
+                let partHead = 0;
+
+                function spawnParticle(x, y, vx, vy, life, size, type) {
+                    const i = partHead;
+                    partHead = (partHead + 1) % MAX_PARTICLES;
+                    partX[i] = x;
+                    partY[i] = y;
+                    partVx[i] = vx;
+                    partVy[i] = vy;
+                    partLife[i] = life;
+                    partMaxLife[i] = life;
+                    partSize[i] = size;
+                    partType[i] = type;
+                }
+
+                const MAX_FLASHES = 24;
+                const flashX = new Float32Array(MAX_FLASHES);
+                const flashY = new Float32Array(MAX_FLASHES);
+                const flashLife = new Float32Array(MAX_FLASHES);
+                const flashMaxLife = new Float32Array(MAX_FLASHES);
+                const flashRadius = new Float32Array(MAX_FLASHES);
+                const flashGhost = new Uint8Array(MAX_FLASHES);
+                let flashHead = 0;
+
+                function spawnFlash(x, y, radius, duration, isGhost) {
+                    const i = flashHead;
+                    flashHead = (flashHead + 1) % MAX_FLASHES;
+                    flashX[i] = x;
+                    flashY[i] = y;
+                    flashRadius[i] = radius;
+                    flashLife[i] = duration;
+                    flashMaxLife[i] = duration;
+                    flashGhost[i] = isGhost ? 1 : 0;
+                }
+
+                function spawnExplosionEffects(x, y, isGhost) {
+                    spawnFlash(
+                        x,
+                        y,
+                        CRATER_RADIUS * 1.45,
+                        isGhost ? 0.28 : 0.38,
+                        isGhost,
+                    );
+                    const sparkCount = isGhost ? 22 : 42;
+                    for (let i = 0; i < sparkCount; i++) {
+                        const ang =
+                            (Math.PI * 2 * i) / sparkCount +
+                            (Math.random() - 0.5) * 0.35;
+                        const spd =
+                            (45 + Math.random() * 195) * (isGhost ? 0.85 : 1.0);
+                        spawnParticle(
+                            x + (Math.random() - 0.5) * 8,
+                            y + (Math.random() - 0.5) * 8,
+                            Math.cos(ang) * spd,
+                            Math.sin(ang) * spd,
+                            0.22 + Math.random() * 0.36,
+                            (isGhost ? 2.5 : 3.5) + Math.random() * 3.5,
+                            isGhost ? 3 : 1,
+                        );
+                    }
+                    const debrisCount = isGhost ? 10 : 18;
+                    for (let i = 0; i < debrisCount; i++) {
+                        const ang = Math.random() * Math.PI * 2;
+                        const spd = 30 + Math.random() * 130;
+                        spawnParticle(
+                            x,
+                            y,
+                            Math.cos(ang) * spd,
+                            Math.sin(ang) * spd - 40,
+                            0.35 + Math.random() * 0.45,
+                            2.5 + Math.random() * 3.0,
+                            2,
+                        );
+                    }
+                }
+
+                function updateVisualEffects(dt) {
+                    for (let i = 0; i < MAX_PARTICLES; i++) {
+                        if (partLife[i] <= 0) continue;
+                        partLife[i] -= dt;
+                        if (partType[i] === 2) {
+                            partVy[i] += GRAVITY * 0.85 * dt;
+                        } else {
+                            partVx[i] *= 0.96;
+                            partVy[i] *= 0.96;
+                        }
+                        partX[i] += partVx[i] * dt;
+                        partY[i] += partVy[i] * dt;
+                    }
+                    for (let i = 0; i < MAX_FLASHES; i++) {
+                        if (flashLife[i] > 0) {
+                            flashLife[i] -= dt;
+                        }
+                    }
+                }
+
+                // ============================================================================
+                // GAME STATE, ROCKET & DYNAMIC GHOST RECORDINGS
+                // ============================================================================
+                // States: 'MENU', 'PLAYING', 'DEAD', 'CLEARED'
+                let gameState = "MENU";
+                let attemptCount = 1;
+                let sessionBestClassicAttempts = null; // Fewest attempts in Classic Mode
+                let sessionBestEndlessMeters = 0; // Furthest distance (m) in Endless Mode
+                let currentMapBestMeters = 0;
+
+                let ghosts = [];
+                let furthestGhostX = START_X;
+
+                // Dynamically expandable recording buffer so Endless runs never run out of ticks
+                let currentRunRecording = new Float32Array(120 * 120 * 4);
+                let currentTick = 0;
+                let stateTimer = 0;
+                let accumulator = 0;
+
+                let inputHeld = false;
+                let paused = false;
+
+                const rocket = {
+                    x: START_X,
+                    y: WORLD_HEIGHT * 0.5,
+                    vx: 0,
+                    vy: 0,
+                    angle: 0,
+                    thrust: 0,
+                    onPad: true,
+                };
+
+                let camX = 0;
+                let shakeMag = 0;
+                let shakeX = 0;
+                let shakeY = 0;
+
+                function pxToMeters(worldX) {
+                    return Math.max(
+                        0,
+                        Math.floor((worldX - START_X) / CELL_SIZE),
+                    );
+                }
+
+                function resetRocketToStart() {
+                    rocket.x = START_X;
+                    rocket.y = getCenterlineYAtWorldX(START_X);
+                    rocket.vx = 0;
+                    rocket.vy = 0;
+                    rocket.angle = -0.18;
+                    rocket.thrust = 0;
+                    rocket.onPad = true;
+                }
+
+                function startAttempt() {
+                    resetTerrainToPristine();
+                    resetRocketToStart();
+                    currentTick = 0;
+                    accumulator = 0;
+                    for (let i = 0; i < ghosts.length; i++) {
+                        ghosts[i].explodedThisRun = false;
+                    }
+                    gameState = "PLAYING";
+                }
+
+                function startNewMap(mode, seed) {
+                    gameMode = mode;
+                    currentSeed = seed >>> 0;
+                    initTunnelParameters(currentSeed);
+                    ensureChunkRendered(0);
+                    ensureChunkRendered(1);
+                    ghosts = [];
+                    furthestGhostX = START_X;
+                    currentMapBestMeters = 0;
+                    attemptCount = 1;
+                    partLife.fill(0);
+                    flashLife.fill(0);
+                    camX = 0;
+                    startAttempt();
+                }
+
+                function openMainMenu() {
+                    sound.setThrust(0);
+                    inputHeld = false;
+                    gameState = "MENU";
+                    currentSeed = generateSessionSeed();
+                    initTunnelParameters(currentSeed);
+                    ensureChunkRendered(0);
+                    ensureChunkRendered(1);
+                    resetRocketToStart();
+                    camX = 0;
+                }
+
+                function checkRocketCollision() {
+                    const cos = Math.cos(rocket.angle);
+                    const sin = Math.sin(rocket.angle);
+
+                    for (let i = 0; i < HULL_POINTS.length; i++) {
+                        const lx = HULL_POINTS[i][0];
+                        const ly = HULL_POINTS[i][1];
+                        const wx = rocket.x + lx * cos - ly * sin;
+                        const wy = rocket.y + lx * sin + ly * cos;
+
+                        const gx = Math.floor(wx / CELL_SIZE);
+                        const gy = Math.floor(wy / CELL_SIZE);
+                        if (gx < 0 || gy < 0 || gy >= GRID_H) return true;
+                        if (getActiveCell(gx, gy) !== 0) return true;
+                    }
+                    return false;
+                }
+
+                function recordCurrentTick() {
+                    const neededLen = (currentTick + 1) * 4;
+                    if (neededLen > currentRunRecording.length) {
+                        const nextBuf = new Float32Array(
+                            currentRunRecording.length * 2,
+                        );
+                        nextBuf.set(currentRunRecording);
+                        currentRunRecording = nextBuf;
+                    }
+                    const base = currentTick * 4;
+                    currentRunRecording[base] = rocket.x;
+                    currentRunRecording[base + 1] = rocket.y;
+                    currentRunRecording[base + 2] = rocket.angle;
+                    currentRunRecording[base + 3] = rocket.thrust;
+                }
+
+                function triggerPlayerDeath() {
+                    gameState = "DEAD";
+                    stateTimer = RESPAWN_DELAY;
+                    sound.setThrust(0);
+                    sound.playExplosion(1.0, false);
+
+                    carveCrater(rocket.x, rocket.y);
+                    spawnExplosionEffects(rocket.x, rocket.y, false);
+                    shakeMag = 11;
+
+                    const framesCopy = currentRunRecording.slice(
+                        0,
+                        (currentTick + 1) * 4,
+                    );
+                    ghosts.push({
+                        frames: framesCopy,
+                        deathTick: currentTick,
+                        deathX: rocket.x,
+                        deathY: rocket.y,
+                        explodedThisRun: false,
+                    });
+
+                    // Free path buffers for ghosts older than GHOST_RENDER_CAP; they still carve craters at deathTick
+                    if (ghosts.length > GHOST_RENDER_CAP) {
+                        const archiveIdx = ghosts.length - GHOST_RENDER_CAP - 1;
+                        if (archiveIdx >= 0) {
+                            ghosts[archiveIdx].frames = null;
+                        }
+                    }
+
+                    if (rocket.x > furthestGhostX) {
+                        furthestGhostX = rocket.x;
+                    }
+
+                    const meters = pxToMeters(rocket.x);
+                    if (meters > currentMapBestMeters)
+                        currentMapBestMeters = meters;
+                    if (
+                        gameMode === "ENDLESS" &&
+                        meters > sessionBestEndlessMeters
+                    ) {
+                        sessionBestEndlessMeters = meters;
+                    }
+                }
+
+                function triggerTunnelCleared() {
+                    gameState = "CLEARED";
+                    stateTimer = 2.6;
+                    sound.setThrust(0);
+                    sound.playWin();
+
+                    if (
+                        sessionBestClassicAttempts === null ||
+                        attemptCount < sessionBestClassicAttempts
+                    ) {
+                        sessionBestClassicAttempts = attemptCount;
+                    }
+
+                    for (let i = 0; i < 45; i++) {
+                        const ang = (Math.PI * 2 * i) / 45;
+                        const spd = 60 + Math.random() * 170;
+                        spawnParticle(
+                            rocket.x,
+                            rocket.y,
+                            Math.cos(ang) * spd,
+                            Math.sin(ang) * spd,
+                            0.4 + Math.random() * 0.45,
+                            3.5 + Math.random() * 3,
+                            1,
+                        );
+                    }
+                }
+
+                // ============================================================================
+                // DETERMINISTIC 120 HZ SIMULATION STEP
+                // ============================================================================
+                function simulateGhostsTick() {
+                    for (let i = 0; i < ghosts.length; i++) {
+                        const g = ghosts[i];
+                        if (!g.explodedThisRun && currentTick >= g.deathTick) {
+                            g.explodedThisRun = true;
+                            carveCrater(g.deathX, g.deathY);
+
+                            const dist = Math.abs(g.deathX - rocket.x);
+                            if (dist < 1100) {
+                                spawnExplosionEffects(g.deathX, g.deathY, true);
+                                const prox = Math.max(0, 1 - dist / 950);
+                                sound.playExplosion(prox * 0.75, true);
+                                if (prox > 0.25) {
+                                    shakeMag = Math.max(shakeMag, prox * 5.0);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                function stepPhysicsTick() {
+                    simulateGhostsTick();
+
+                    if (gameState !== "PLAYING") {
+                        currentTick++;
+                        return;
+                    }
+
+                    if (inputHeld) {
+                        rocket.thrust = Math.min(
+                            1,
+                            rocket.thrust + THRUST_RAMP_UP * FIXED_DT,
+                        );
+                    } else {
+                        rocket.thrust = Math.max(
+                            0,
+                            rocket.thrust - THRUST_RAMP_DOWN * FIXED_DT,
+                        );
+                    }
+                    sound.setThrust(rocket.thrust);
+
+                    if (rocket.onPad) {
+                        if (inputHeld) {
+                            rocket.onPad = false;
+                            rocket.vx = 115;
+                            rocket.vy = -42;
+                            rocket.angle = -0.35;
+                        } else {
+                            recordCurrentTick();
+                            currentTick++;
+                            return;
+                        }
+                    }
+
+                    const velAngle = Math.atan2(
+                        rocket.vy,
+                        Math.max(75, rocket.vx),
+                    );
+                    let targetAngle = velAngle * 0.65 - rocket.thrust * 0.85;
+                    if (rocket.thrust > 0.04) {
+                        targetAngle = Math.min(
+                            targetAngle,
+                            -0.46 * rocket.thrust,
+                        );
+                    }
+                    targetAngle = Math.max(-1.1, Math.min(0.62, targetAngle));
+
+                    const easeRate = inputHeld
+                        ? ROT_EASE_THRUST
+                        : ROT_EASE_COAST;
+                    rocket.angle +=
+                        (targetAngle - rocket.angle) * easeRate * FIXED_DT;
+
+                    const accel = rocket.thrust * THRUST_POWER;
+                    rocket.vx += Math.cos(rocket.angle) * accel * FIXED_DT;
+                    rocket.vy +=
+                        (Math.sin(rocket.angle) * accel + GRAVITY) * FIXED_DT;
+
+                    if (rocket.vy > 0 && rocket.vx < 155) {
+                        rocket.vx += rocket.vy * 0.34 * FIXED_DT;
+                    }
+
+                    rocket.vx *= VELOCITY_DAMPING;
+                    rocket.vy *= VELOCITY_DAMPING;
+
+                    const spd = Math.hypot(rocket.vx, rocket.vy);
+                    if (spd > MAX_SPEED) {
+                        const scale = MAX_SPEED / spd;
+                        rocket.vx *= scale;
+                        rocket.vy *= scale;
+                    }
+
+                    rocket.x += rocket.vx * FIXED_DT;
+                    rocket.y += rocket.vy * FIXED_DT;
+
+                    // Live distance tracking in Endless Mode
+                    if (gameMode === "ENDLESS") {
+                        const meters = pxToMeters(rocket.x);
+                        if (meters > currentMapBestMeters)
+                            currentMapBestMeters = meters;
+                        if (meters > sessionBestEndlessMeters)
+                            sessionBestEndlessMeters = meters;
+                    }
+
+                    // Spawn exhaust particles scaled with current thrust
+                    if (rocket.thrust > 0.05 && (currentTick & 1) === 0) {
+                        const cos = Math.cos(rocket.angle);
+                        const sin = Math.sin(rocket.angle);
+                        const tailX = rocket.x - cos * 15;
+                        const tailY = rocket.y - sin * 15;
+                        const spread = (Math.random() - 0.5) * 0.38;
+                        const ejectAngle = rocket.angle + Math.PI + spread;
+                        const ejectSpd =
+                            90 + rocket.thrust * 170 + Math.random() * 40;
+                        spawnParticle(
+                            tailX,
+                            tailY,
+                            rocket.vx * 0.25 + Math.cos(ejectAngle) * ejectSpd,
+                            rocket.vy * 0.25 + Math.sin(ejectAngle) * ejectSpd,
+                            0.1 + rocket.thrust * 0.16,
+                            2.0 + rocket.thrust * 3.8,
+                            0,
+                        );
+                    }
+
+                    recordCurrentTick();
+
+                    if (gameMode === "CLASSIC" && rocket.x >= FINISH_X) {
+                        triggerTunnelCleared();
+                    } else if (checkRocketCollision()) {
+                        triggerPlayerDeath();
+                    }
+
+                    currentTick++;
+                }
+
+                // ============================================================================
+                // RENDERING, HUD & INTERACTIVE MAIN MENU
+                // ============================================================================
+                const canvas = document.getElementById("gameCanvas");
+                const ctx = canvas.getContext("2d");
+                let screenW = window.innerWidth;
+                let screenH = window.innerHeight;
+                let dpr = Math.min(2, window.devicePixelRatio || 1);
+
+                // Interactive UI hitboxes
+                const muteBtnRect = { x: 0, y: 0, w: 88, h: 30 };
+                const menuBtnRect = { x: 0, y: 0, w: 68, h: 30 };
+                const newMapBtnRect = { x: 0, y: 0, w: 86, h: 30 };
+                const classicCardRect = { x: 0, y: 0, w: 0, h: 0 };
+                const endlessCardRect = { x: 0, y: 0, w: 0, h: 0 };
+
+                function resizeCanvas() {
+                    screenW = window.innerWidth;
+                    screenH = window.innerHeight;
+                    dpr = Math.min(2, window.devicePixelRatio || 1);
+                    canvas.width = Math.floor(screenW * dpr);
+                    canvas.height = Math.floor(screenH * dpr);
+                }
+                window.addEventListener("resize", resizeCanvas);
+                resizeCanvas();
+
+                function pointInRect(px, py, r) {
+                    return (
+                        px >= r.x &&
+                        px <= r.x + r.w &&
+                        py >= r.y &&
+                        py <= r.y + r.h
+                    );
+                }
+
+                function drawRocketShape(
+                    x,
+                    y,
+                    angle,
+                    thrustLevel,
+                    isGhost,
+                    alpha,
+                    warningPulse,
+                ) {
+                    ctx.save();
+                    ctx.translate(x, y);
+                    ctx.rotate(angle);
+                    ctx.globalAlpha = alpha;
+
+                    if (thrustLevel > 0.02) {
+                        const flicker =
+                            0.88 + Math.sin(performance.now() * 0.06) * 0.14;
+                        const flameLen = (8 + thrustLevel * 24) * flicker;
+                        const flameHalfW = 2.5 + thrustLevel * 4.2;
+
+                        ctx.beginPath();
+                        ctx.moveTo(-12, -flameHalfW);
+                        ctx.lineTo(-12 - flameLen, 0);
+                        ctx.lineTo(-12, flameHalfW);
+                        ctx.closePath();
+                        ctx.fillStyle = isGhost
+                            ? warningPulse
+                                ? "#ff9f4a"
+                                : "#58d5ff"
+                            : "#ff7b24";
+                        ctx.fill();
+
+                        ctx.beginPath();
+                        ctx.moveTo(-12, -flameHalfW * 0.55);
+                        ctx.lineTo(-12 - flameLen * 0.62, 0);
+                        ctx.lineTo(-12, flameHalfW * 0.55);
+                        ctx.closePath();
+                        ctx.fillStyle = isGhost ? "#e0faff" : "#fff7cc";
+                        ctx.fill();
+                    }
+
+                    if (isGhost) {
+                        ctx.fillStyle = warningPulse ? "#ffae52" : "#7ce2ff";
+                        ctx.strokeStyle = warningPulse ? "#ffe3b3" : "#c4f4ff";
+                        ctx.lineWidth = 1.2;
+
+                        ctx.beginPath();
+                        ctx.moveTo(15, 0);
+                        ctx.lineTo(5, -6.5);
+                        ctx.lineTo(-11, -6.5);
+                        ctx.lineTo(-14, -10);
+                        ctx.lineTo(-12, 0);
+                        ctx.lineTo(-14, 10);
+                        ctx.lineTo(-11, 6.5);
+                        ctx.lineTo(5, 6.5);
+                        ctx.closePath();
+                        ctx.fill();
+                        ctx.stroke();
+                    } else {
+                        const glow = ctx.createRadialGradient(
+                            0,
+                            0,
+                            2,
+                            0,
+                            0,
+                            24,
+                        );
+                        glow.addColorStop(0, "rgba(255, 160, 75, 0.32)");
+                        glow.addColorStop(1, "rgba(255, 160, 75, 0)");
+                        ctx.fillStyle = glow;
+                        ctx.beginPath();
+                        ctx.arc(0, 0, 24, 0, Math.PI * 2);
+                        ctx.fill();
+
+                        ctx.fillStyle = "#e04f33";
+                        ctx.beginPath();
+                        ctx.moveTo(-5, -5);
+                        ctx.lineTo(-14, -11);
+                        ctx.lineTo(-12, -4);
+                        ctx.closePath();
+                        ctx.fill();
+
+                        ctx.beginPath();
+                        ctx.moveTo(-5, 5);
+                        ctx.lineTo(-14, 11);
+                        ctx.lineTo(-12, 4);
+                        ctx.closePath();
+                        ctx.fill();
+
+                        ctx.fillStyle = "#38465e";
+                        ctx.fillRect(-13.5, -3.5, 4, 7);
+
+                        ctx.fillStyle = "#f2f6fc";
+                        ctx.beginPath();
+                        ctx.moveTo(15, 0);
+                        ctx.quadraticCurveTo(8, -6.8, -10, -6.2);
+                        ctx.lineTo(-10, 6.2);
+                        ctx.quadraticCurveTo(8, 6.8, 15, 0);
+                        ctx.closePath();
+                        ctx.fill();
+
+                        ctx.fillStyle = "#ff6b3d";
+                        ctx.beginPath();
+                        ctx.moveTo(15, 0);
+                        ctx.quadraticCurveTo(10, -4.5, 4, -5.5);
+                        ctx.lineTo(4, 5.5);
+                        ctx.quadraticCurveTo(10, 4.5, 15, 0);
+                        ctx.closePath();
+                        ctx.fill();
+
+                        ctx.fillStyle = "#38bdf8";
+                        ctx.beginPath();
+                        ctx.ellipse(-1, 0, 4.2, 2.6, 0, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    ctx.restore();
+                }
+
+                function renderGhosts(minVisibleX, maxVisibleX) {
+                    const total = ghosts.length;
+                    if (total === 0) return;
+
+                    const startIdx = Math.max(0, total - GHOST_RENDER_CAP);
+                    const renderedCount = total - startIdx;
+
+                    for (let i = startIdx; i < total; i++) {
+                        const g = ghosts[i];
+                        if (!g.frames || currentTick > g.deathTick) continue;
+
+                        const base = currentTick * 4;
+                        const gx = g.frames[base];
+                        if (gx < minVisibleX - 120 || gx > maxVisibleX + 120)
+                            continue;
+
+                        const gy = g.frames[base + 1];
+                        const gAngle = g.frames[base + 2];
+                        const gThrust = g.frames[base + 3];
+
+                        const rank = (i - startIdx + 1) / renderedCount;
+                        const alpha = 0.14 + 0.42 * rank;
+                        const ticksLeft = g.deathTick - currentTick;
+                        const warningPulse =
+                            ticksLeft < 32 && ((ticksLeft >> 2) & 1) === 0;
+
+                        const trailStartTick = Math.max(0, currentTick - 28);
+                        if (currentTick > trailStartTick) {
+                            ctx.save();
+                            ctx.beginPath();
+                            for (
+                                let t = trailStartTick;
+                                t <= currentTick;
+                                t += 2
+                            ) {
+                                const tb = t * 4;
+                                const tx = g.frames[tb];
+                                const ty = g.frames[tb + 1];
+                                if (t === trailStartTick) ctx.moveTo(tx, ty);
+                                else ctx.lineTo(tx, ty);
+                            }
+                            ctx.strokeStyle = warningPulse
+                                ? `rgba(255, 175, 85, ${alpha * 0.55})`
+                                : `rgba(110, 218, 255, ${alpha * 0.45})`;
+                            ctx.lineWidth = 1.6;
+                            ctx.stroke();
+                            ctx.restore();
+                        }
+
+                        if (ticksLeft > 0 && ticksLeft <= 30) {
+                            const frac = ticksLeft / 30;
+                            ctx.save();
+                            ctx.beginPath();
+                            ctx.arc(
+                                g.deathX,
+                                g.deathY,
+                                CRATER_RADIUS * (0.35 + frac * 0.65),
+                                0,
+                                Math.PI * 2,
+                            );
+                            ctx.strokeStyle = `rgba(255, 155, 70, ${(1 - frac) * 0.55})`;
+                            ctx.lineWidth = 1.5;
+                            ctx.stroke();
+                            ctx.restore();
+                        }
+
+                        drawRocketShape(
+                            gx,
+                            gy,
+                            gAngle,
+                            gThrust,
+                            true,
+                            alpha,
+                            warningPulse,
+                        );
+                    }
+                }
+
+                function renderParticles(minVisibleX, maxVisibleX) {
+                    for (let i = 0; i < MAX_FLASHES; i++) {
+                        if (flashLife[i] <= 0) continue;
+                        const fx = flashX[i];
+                        if (fx < minVisibleX - 150 || fx > maxVisibleX + 150)
+                            continue;
+                        const fy = flashY[i];
+                        const t = flashLife[i] / flashMaxLife[i];
+                        const rad = flashRadius[i] * (1.25 - t * 0.45);
+                        const isGhost = flashGhost[i] === 1;
+
+                        const grad = ctx.createRadialGradient(
+                            fx,
+                            fy,
+                            2,
+                            fx,
+                            fy,
+                            rad,
+                        );
+                        if (isGhost) {
+                            grad.addColorStop(
+                                0,
+                                `rgba(255, 245, 215, ${t * 0.75})`,
+                            );
+                            grad.addColorStop(
+                                0.45,
+                                `rgba(255, 165, 80, ${t * 0.45})`,
+                            );
+                            grad.addColorStop(1, "rgba(255, 110, 40, 0)");
+                        } else {
+                            grad.addColorStop(
+                                0,
+                                `rgba(255, 252, 225, ${t * 0.92})`,
+                            );
+                            grad.addColorStop(
+                                0.4,
+                                `rgba(255, 140, 45, ${t * 0.65})`,
+                            );
+                            grad.addColorStop(1, "rgba(220, 50, 25, 0)");
+                        }
+                        ctx.fillStyle = grad;
+                        ctx.beginPath();
+                        ctx.arc(fx, fy, rad, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    for (let i = 0; i < MAX_PARTICLES; i++) {
+                        if (partLife[i] <= 0) continue;
+                        const px = partX[i];
+                        if (px < minVisibleX - 50 || px > maxVisibleX + 50)
+                            continue;
+                        const py = partY[i];
+                        const t = partLife[i] / partMaxLife[i];
+                        const sz = partSize[i] * (0.4 + 0.6 * t);
+                        const type = partType[i];
+
+                        if (type === 0) {
+                            if (t > 0.65)
+                                ctx.fillStyle = `rgba(255, 242, 185, ${t})`;
+                            else if (t > 0.3)
+                                ctx.fillStyle = `rgba(255, 138, 42, ${t * 0.9})`;
+                            else
+                                ctx.fillStyle = `rgba(180, 62, 48, ${t * 0.75})`;
+                        } else if (type === 1) {
+                            ctx.fillStyle =
+                                t > 0.5
+                                    ? `rgba(255, 228, 140, ${t})`
+                                    : `rgba(242, 92, 38, ${t})`;
+                        } else if (type === 2) {
+                            ctx.fillStyle = `rgba(98, 118, 148, ${t * 0.9})`;
+                        } else {
+                            ctx.fillStyle =
+                                t > 0.5
+                                    ? `rgba(205, 245, 255, ${t * 0.9})`
+                                    : `rgba(255, 152, 68, ${t * 0.85})`;
+                        }
+
+                        ctx.beginPath();
+                        ctx.arc(px, py, sz, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+
+                function renderWorldProps(minVisibleX, maxVisibleX) {
+                    // Launch pad in start zone
+                    if (
+                        START_X >= minVisibleX - 80 &&
+                        START_X <= maxVisibleX + 80
+                    ) {
+                        const startY = getCenterlineYAtWorldX(START_X);
+                        const padY = startY + 10;
+
+                        ctx.fillStyle = "#2d3b52";
+                        ctx.fillRect(START_X - 24, padY, 48, 5);
+                        ctx.fillStyle = "#38bdf8";
+                        ctx.fillRect(START_X - 18, padY + 1, 36, 2);
+
+                        const pulse =
+                            0.25 + 0.15 * Math.sin(performance.now() * 0.004);
+                        ctx.strokeStyle = `rgba(100, 200, 255, ${pulse})`;
+                        ctx.lineWidth = 2;
+                        for (let k = 0; k < 3; k++) {
+                            const cx = START_X + 75 + k * 22;
+                            ctx.beginPath();
+                            ctx.moveTo(cx - 6, startY - 8);
+                            ctx.lineTo(cx + 2, startY);
+                            ctx.lineTo(cx - 6, startY + 8);
+                            ctx.stroke();
+                        }
+                    }
+
+                    // Distance markers every 250m (1000 world px) in Endless Mode
+                    if (gameMode === "ENDLESS") {
+                        const firstMark = Math.max(
+                            1000,
+                            Math.floor(minVisibleX / 1000) * 1000,
+                        );
+                        for (
+                            let mx = firstMark;
+                            mx <= maxVisibleX;
+                            mx += 1000
+                        ) {
+                            const worldX = START_X + mx;
+                            if (
+                                worldX < minVisibleX - 40 ||
+                                worldX > maxVisibleX + 40
+                            )
+                                continue;
+                            ctx.save();
+                            ctx.strokeStyle = "rgba(124, 226, 255, 0.14)";
+                            ctx.lineWidth = 1.5;
+                            ctx.setLineDash([6, 8]);
+                            ctx.beginPath();
+                            ctx.moveTo(worldX, 0);
+                            ctx.lineTo(worldX, WORLD_HEIGHT);
+                            ctx.stroke();
+
+                            ctx.fillStyle = "rgba(124, 226, 255, 0.35)";
+                            ctx.font =
+                                '700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                            ctx.textAlign = "center";
+                            ctx.fillText(`${mx / CELL_SIZE}m`, worldX, 24);
+                            ctx.restore();
+                        }
+                    }
+
+                    // Finish line laser gate in Classic Mode
+                    if (
+                        gameMode === "CLASSIC" &&
+                        FINISH_X >= minVisibleX - 100 &&
+                        FINISH_X <= maxVisibleX + 100
+                    ) {
+                        const finGrad = ctx.createLinearGradient(
+                            FINISH_X - 25,
+                            0,
+                            FINISH_X + 25,
+                            0,
+                        );
+                        finGrad.addColorStop(0, "rgba(56, 239, 125, 0)");
+                        finGrad.addColorStop(0.5, "rgba(56, 239, 125, 0.26)");
+                        finGrad.addColorStop(1, "rgba(56, 239, 125, 0)");
+                        ctx.fillStyle = finGrad;
+                        ctx.fillRect(FINISH_X - 25, 0, 50, WORLD_HEIGHT);
+
+                        ctx.save();
+                        ctx.strokeStyle = "#4ade80";
+                        ctx.lineWidth = 2.5;
+                        ctx.setLineDash([12, 10]);
+                        ctx.lineDashOffset = -performance.now() * 0.04;
+                        ctx.beginPath();
+                        ctx.moveTo(FINISH_X, 0);
+                        ctx.lineTo(FINISH_X, WORLD_HEIGHT);
+                        ctx.stroke();
+                        ctx.restore();
+                    }
+                }
+
+                function renderMuteButton(pad) {
+                    muteBtnRect.w = 88;
+                    muteBtnRect.h = 30;
+                    muteBtnRect.x = screenW - muteBtnRect.w - pad;
+                    muteBtnRect.y = 11;
+
+                    ctx.fillStyle = "rgba(20, 28, 42, 0.82)";
+                    ctx.strokeStyle = "rgba(120, 148, 185, 0.35)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.roundRect(
+                        muteBtnRect.x,
+                        muteBtnRect.y,
+                        muteBtnRect.w,
+                        muteBtnRect.h,
+                        6,
+                    );
+                    ctx.fill();
+                    ctx.stroke();
+
+                    const sx = muteBtnRect.x + 14;
+                    const sy = muteBtnRect.y + 15;
+                    ctx.fillStyle = sound.muted ? "#64748b" : "#cbd5e1";
+                    ctx.beginPath();
+                    ctx.moveTo(sx, sy - 3);
+                    ctx.lineTo(sx + 4, sy - 3);
+                    ctx.lineTo(sx + 9, sy - 7);
+                    ctx.lineTo(sx + 9, sy + 7);
+                    ctx.lineTo(sx + 4, sy + 3);
+                    ctx.lineTo(sx, sy + 3);
+                    ctx.closePath();
+                    ctx.fill();
+
+                    if (!sound.muted) {
+                        ctx.strokeStyle = "#7ce2ff";
+                        ctx.lineWidth = 1.4;
+                        ctx.beginPath();
+                        ctx.arc(sx + 10, sy, 4, -0.7, 0.7);
+                        ctx.stroke();
+                    } else {
+                        ctx.strokeStyle = "#ef4444";
+                        ctx.lineWidth = 1.6;
+                        ctx.beginPath();
+                        ctx.moveTo(sx + 12, sy - 4);
+                        ctx.lineTo(sx + 18, sy + 4);
+                        ctx.moveTo(sx + 18, sy - 4);
+                        ctx.lineTo(sx + 12, sy + 4);
+                        ctx.stroke();
+                    }
+
+                    ctx.font =
+                        '600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.textAlign = "left";
+                    ctx.textBaseline = "middle";
+                    ctx.fillStyle = sound.muted ? "#94a3b8" : "#e2e8f0";
+                    ctx.fillText(
+                        sound.muted ? "MUTED" : "SOUND",
+                        sx + 22,
+                        sy + 0.5,
+                    );
+                }
+
+                function renderHUD() {
+                    const pad = 16;
+                    ctx.save();
+                    renderMuteButton(pad);
+
+                    if (gameState === "MENU") {
+                        ctx.restore();
+                        return;
+                    }
+
+                    // Top-right MENU and NEW MAP buttons
+                    menuBtnRect.w = 64;
+                    menuBtnRect.h = 30;
+                    menuBtnRect.x = muteBtnRect.x - menuBtnRect.w - 8;
+                    menuBtnRect.y = 11;
+
+                    newMapBtnRect.w = 82;
+                    newMapBtnRect.h = 30;
+                    newMapBtnRect.x = menuBtnRect.x - newMapBtnRect.w - 8;
+                    newMapBtnRect.y = 11;
+
+                    ctx.fillStyle = "rgba(20, 28, 42, 0.82)";
+                    ctx.strokeStyle = "rgba(120, 148, 185, 0.35)";
+                    ctx.lineWidth = 1;
+
+                    ctx.beginPath();
+                    ctx.roundRect(
+                        menuBtnRect.x,
+                        menuBtnRect.y,
+                        menuBtnRect.w,
+                        menuBtnRect.h,
+                        6,
+                    );
+                    ctx.fill();
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.roundRect(
+                        newMapBtnRect.x,
+                        newMapBtnRect.y,
+                        newMapBtnRect.w,
+                        newMapBtnRect.h,
+                        6,
+                    );
+                    ctx.fill();
+                    ctx.stroke();
+
+                    ctx.font =
+                        '600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillStyle = "#e2e8f0";
+                    ctx.fillText(
+                        "MENU",
+                        menuBtnRect.x + menuBtnRect.w * 0.5,
+                        menuBtnRect.y + 15.5,
+                    );
+                    ctx.fillStyle = "#94a3b8";
+                    ctx.fillText(
+                        "NEW MAP",
+                        newMapBtnRect.x + newMapBtnRect.w * 0.5,
+                        newMapBtnRect.y + 15.5,
+                    );
+
+                    // Mode badge + stats on top-left
+                    ctx.textAlign = "left";
+                    ctx.font =
+                        '700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle =
+                        gameMode === "CLASSIC" ? "#ff9f43" : "#38bdf8";
+                    ctx.fillText(
+                        `${gameMode}  #${formatSeedCode(currentSeed)}`,
+                        pad,
+                        19,
+                    );
+
+                    const statY = 38;
+                    ctx.font =
+                        '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "rgba(148, 168, 198, 0.85)";
+                    ctx.fillText("ATTEMPT", pad, statY);
+                    ctx.fillStyle = "#f8fafc";
+                    ctx.font =
+                        '700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillText(String(attemptCount), pad + 62, statY);
+
+                    ctx.font =
+                        '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "rgba(148, 168, 198, 0.85)";
+                    ctx.fillText("GHOSTS", pad + 102, statY);
+                    ctx.fillStyle = "#7ce2ff";
+                    ctx.font =
+                        '700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillText(String(ghosts.length), pad + 158, statY);
+
+                    if (gameMode === "CLASSIC") {
+                        if (sessionBestClassicAttempts !== null) {
+                            ctx.font =
+                                '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                            ctx.fillStyle = "rgba(148, 168, 198, 0.85)";
+                            ctx.fillText("BEST", pad + 196, statY);
+                            ctx.fillStyle = "#4ade80";
+                            ctx.font =
+                                '700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                            ctx.fillText(
+                                String(sessionBestClassicAttempts),
+                                pad + 232,
+                                statY,
+                            );
+                        }
+                    } else {
+                        const curMeters = pxToMeters(rocket.x);
+                        ctx.font =
+                            '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                        ctx.fillStyle = "rgba(148, 168, 198, 0.85)";
+                        ctx.fillText("DIST", pad + 196, statY);
+                        ctx.fillStyle = "#ffd166";
+                        ctx.font =
+                            '700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                        ctx.fillText(`${curMeters}m`, pad + 230, statY);
+
+                        ctx.font =
+                            '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                        ctx.fillStyle = "rgba(148, 168, 198, 0.85)";
+                        ctx.fillText("BEST", pad + 288, statY);
+                        ctx.fillStyle = "#4ade80";
+                        ctx.font =
+                            '700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                        ctx.fillText(
+                            `${sessionBestEndlessMeters}m`,
+                            pad + 324,
+                            statY,
+                        );
+                    }
+
+                    // Thin progress bar
+                    const availCenterW = newMapBtnRect.x - (pad + 370) - 24;
+                    const barW =
+                        availCenterW > 160
+                            ? Math.min(340, availCenterW)
+                            : Math.min(320, screenW - pad * 2);
+                    const barH = 5;
+                    const barX =
+                        availCenterW > 160 ? (screenW - barW) * 0.5 : pad;
+                    const barY = availCenterW > 160 ? 24 : 58;
+
+                    ctx.fillStyle = "rgba(255, 255, 255, 0.12)";
+                    ctx.beginPath();
+                    ctx.roundRect(barX, barY, barW, barH, 3);
+                    ctx.fill();
+
+                    // In Classic Mode, bar spans TUNNEL_LENGTH; in Endless Mode, bar scales to next 500m milestone beyond furthest ghost
+                    const referenceSpan =
+                        gameMode === "CLASSIC"
+                            ? TUNNEL_LENGTH
+                            : Math.max(
+                                  2000,
+                                  Math.ceil(
+                                      (Math.max(rocket.x, furthestGhostX) -
+                                          START_X +
+                                          600) /
+                                          2000,
+                                  ) * 2000,
+                              );
+
+                    const progress = Math.max(
+                        0,
+                        Math.min(1, (rocket.x - START_X) / referenceSpan),
+                    );
+                    if (progress > 0) {
+                        const grad = ctx.createLinearGradient(
+                            barX,
+                            0,
+                            barX + barW,
+                            0,
+                        );
+                        if (gameMode === "CLASSIC") {
+                            grad.addColorStop(0, "#ff7b29");
+                            grad.addColorStop(1, "#ffd166");
+                        } else {
+                            grad.addColorStop(0, "#38bdf8");
+                            grad.addColorStop(1, "#818cf8");
+                        }
+                        ctx.fillStyle = grad;
+                        ctx.beginPath();
+                        ctx.roundRect(
+                            barX,
+                            barY,
+                            Math.max(4, barW * progress),
+                            barH,
+                            3,
+                        );
+                        ctx.fill();
+                    }
+
+                    if (ghosts.length > 0 && furthestGhostX > START_X) {
+                        const ghostProg = Math.max(
+                            0,
+                            Math.min(
+                                1,
+                                (furthestGhostX - START_X) / referenceSpan,
+                            ),
+                        );
+                        const mx = barX + barW * ghostProg;
+                        ctx.fillStyle = "#7ce2ff";
+                        ctx.fillRect(mx - 1, barY - 4, 2, barH + 8);
+
+                        ctx.beginPath();
+                        ctx.moveTo(mx, barY - 4);
+                        ctx.lineTo(mx - 4, barY - 9);
+                        ctx.lineTo(mx + 4, barY - 9);
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+
+                    ctx.restore();
+                }
+
+                function renderMainMenuOverlay() {
+                    ctx.save();
+                    ctx.fillStyle = "rgba(8, 12, 20, 0.74)";
+                    ctx.fillRect(0, 0, screenW, screenH);
+
+                    const cx = screenW * 0.5;
+                    const cy = screenH * 0.5;
+
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+
+                    // Title & tagline
+                    ctx.font =
+                        '800 44px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#f8fafc";
+                    ctx.fillText("BLAST ECHO", cx, cy - 125);
+
+                    ctx.font =
+                        '500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#94a3b8";
+                    ctx.fillText(
+                        "Every crash carves a crater. Time your flight behind your ghosts.",
+                        cx,
+                        cy - 84,
+                    );
+
+                    // Mode selection cards
+                    const isWide = screenW >= 580;
+                    const cardW = isWide ? 245 : Math.min(320, screenW - 40);
+                    const cardH = isWide ? 148 : 112;
+                    const gap = 18;
+
+                    if (isWide) {
+                        classicCardRect.w = cardW;
+                        classicCardRect.h = cardH;
+                        classicCardRect.x = cx - cardW - gap * 0.5;
+                        classicCardRect.y = cy - 42;
+
+                        endlessCardRect.w = cardW;
+                        endlessCardRect.h = cardH;
+                        endlessCardRect.x = cx + gap * 0.5;
+                        endlessCardRect.y = cy - 42;
+                    } else {
+                        classicCardRect.w = cardW;
+                        classicCardRect.h = cardH;
+                        classicCardRect.x = cx - cardW * 0.5;
+                        classicCardRect.y = cy - 52;
+
+                        endlessCardRect.w = cardW;
+                        endlessCardRect.h = cardH;
+                        endlessCardRect.x = cx - cardW * 0.5;
+                        endlessCardRect.y = classicCardRect.y + cardH + 14;
+                    }
+
+                    // Draw Classic Mode Card
+                    ctx.fillStyle = "rgba(22, 31, 48, 0.92)";
+                    ctx.strokeStyle = "#ff8a3d";
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.roundRect(
+                        classicCardRect.x,
+                        classicCardRect.y,
+                        classicCardRect.w,
+                        classicCardRect.h,
+                        10,
+                    );
+                    ctx.fill();
+                    ctx.stroke();
+
+                    const cMidX = classicCardRect.x + classicCardRect.w * 0.5;
+                    const cTopY = classicCardRect.y;
+                    ctx.font =
+                        '800 20px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#ff9f43";
+                    ctx.fillText("CLASSIC MODE", cMidX, cTopY + 32);
+
+                    ctx.font =
+                        '500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#cbd5e1";
+                    ctx.fillText(
+                        "Break through 4 pinch points",
+                        cMidX,
+                        cTopY + 62,
+                    );
+                    ctx.fillText(
+                        "to reach the 1,300m finish gate.",
+                        cMidX,
+                        cTopY + 80,
+                    );
+
+                    ctx.font =
+                        '700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle =
+                        sessionBestClassicAttempts !== null
+                            ? "#4ade80"
+                            : "#64748b";
+                    ctx.fillText(
+                        sessionBestClassicAttempts !== null
+                            ? `SESSION BEST: ${sessionBestClassicAttempts} ATTEMPTS`
+                            : "TAP OR PRESS [1] TO LAUNCH",
+                        cMidX,
+                        cTopY + classicCardRect.h - 22,
+                    );
+
+                    // Draw Endless Mode Card
+                    ctx.fillStyle = "rgba(22, 31, 48, 0.92)";
+                    ctx.strokeStyle = "#38bdf8";
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.roundRect(
+                        endlessCardRect.x,
+                        endlessCardRect.y,
+                        endlessCardRect.w,
+                        endlessCardRect.h,
+                        10,
+                    );
+                    ctx.fill();
+                    ctx.stroke();
+
+                    const eMidX = endlessCardRect.x + endlessCardRect.w * 0.5;
+                    const eTopY = endlessCardRect.y;
+                    ctx.font =
+                        '800 20px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#38bdf8";
+                    ctx.fillText("ENDLESS MODE", eMidX, eTopY + 32);
+
+                    ctx.font =
+                        '500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#cbd5e1";
+                    ctx.fillText(
+                        "Infinite procedural rock tunnel.",
+                        eMidX,
+                        eTopY + 62,
+                    );
+                    ctx.fillText(
+                        "Chain blasts as deep as you can.",
+                        eMidX,
+                        eTopY + 80,
+                    );
+
+                    ctx.font =
+                        '700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle =
+                        sessionBestEndlessMeters > 0 ? "#4ade80" : "#64748b";
+                    ctx.fillText(
+                        sessionBestEndlessMeters > 0
+                            ? `SESSION BEST: ${sessionBestEndlessMeters}m`
+                            : "TAP OR PRESS [2] TO LAUNCH",
+                        eMidX,
+                        eTopY + endlessCardRect.h - 22,
+                    );
+
+                    // Footer controls hint
+                    const footerY = isWide
+                        ? cy + 138
+                        : endlessCardRect.y + cardH + 28;
+                    ctx.font =
+                        '500 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#64748b";
+                    ctx.fillText(
+                        "HOLD CLICK / TOUCH / SPACE TO FIRE THRUSTER  •  UNIQUE SEED EVERY MAP",
+                        cx,
+                        footerY,
+                    );
+
+                    ctx.restore();
+                }
+
+                function renderClearedOverlay() {
+                    if (gameState !== "CLEARED") return;
+                    ctx.save();
+                    ctx.fillStyle = "rgba(9, 13, 21, 0.68)";
+                    ctx.fillRect(0, 0, screenW, screenH);
+
+                    const cx = screenW * 0.5;
+                    const cy = screenH * 0.5;
+
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+
+                    ctx.font =
+                        '800 36px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#4ade80";
+                    ctx.fillText("TUNNEL CLEARED", cx, cy - 44);
+
+                    ctx.font =
+                        '600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#f8fafc";
+                    ctx.fillText(`ATTEMPTS USED: ${attemptCount}`, cx, cy + 2);
+
+                    ctx.font =
+                        '600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#7ce2ff";
+                    ctx.fillText(
+                        `SESSION BEST: ${sessionBestClassicAttempts}`,
+                        cx,
+                        cy + 32,
+                    );
+
+                    ctx.font =
+                        '500 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+                    ctx.fillStyle = "#94a3b8";
+                    ctx.fillText(
+                        "GENERATING NEW RANDOM TUNNEL...",
+                        cx,
+                        cy + 68,
+                    );
+
+                    ctx.restore();
+                }
+
+                function renderFrame(frameDt) {
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+                    const scale = Math.min(
+                        screenH / WORLD_HEIGHT,
+                        screenW / 660,
+                    );
+                    const viewWorldW = screenW / scale;
+                    const offsetY = (screenH - WORLD_HEIGHT * scale) * 0.5;
+
+                    // Smooth camera follow (slow ambient pan while on Main Menu)
+                    if (gameState === "MENU") {
+                        camX = (performance.now() * 0.035) % 900;
+                    } else {
+                        const maxCamX =
+                            gameMode === "CLASSIC"
+                                ? Math.max(0, CLASSIC_WORLD_WIDTH - viewWorldW)
+                                : 0x7fffffff;
+                        const targetCamX = Math.max(
+                            0,
+                            Math.min(maxCamX, rocket.x - viewWorldW * 0.28),
+                        );
+                        camX +=
+                            (targetCamX - camX) * (1 - Math.exp(-10 * frameDt));
+                    }
+
+                    if (shakeMag > 0.1) {
+                        shakeX = (Math.random() - 0.5) * 2 * shakeMag;
+                        shakeY = (Math.random() - 0.5) * 2 * shakeMag;
+                        shakeMag *= Math.exp(-14 * frameDt);
+                    } else {
+                        shakeMag = 0;
+                        shakeX = 0;
+                        shakeY = 0;
+                    }
+
+                    ctx.fillStyle = "#121722";
+                    ctx.fillRect(0, 0, screenW, screenH);
+
+                    ctx.save();
+                    ctx.translate(shakeX, offsetY + shakeY);
+                    ctx.scale(scale, scale);
+
+                    const bgGrad = ctx.createLinearGradient(
+                        0,
+                        0,
+                        0,
+                        WORLD_HEIGHT,
+                    );
+                    bgGrad.addColorStop(0, "#070a10");
+                    bgGrad.addColorStop(0.5, "#0d131f");
+                    bgGrad.addColorStop(1, "#070a10");
+                    ctx.fillStyle = bgGrad;
+                    ctx.fillRect(0, 0, viewWorldW, WORLD_HEIGHT);
+
+                    ctx.fillStyle = "rgba(22, 30, 46, 0.55)";
+                    const parallaxOffset = -(camX * 0.35) % 180;
+                    for (
+                        let px = parallaxOffset - 180;
+                        px < viewWorldW + 180;
+                        px += 180
+                    ) {
+                        ctx.fillRect(px, 0, 52, WORLD_HEIGHT);
+                    }
+
+                    ctx.translate(-camX, 0);
+
+                    const minVisibleX = camX;
+                    const maxVisibleX = camX + viewWorldW;
+
+                    renderWorldProps(minVisibleX, maxVisibleX);
+
+                    // Draw only visible terrain chunks
+                    const firstChunk = Math.max(
+                        0,
+                        Math.floor(minVisibleX / (CHUNK_W * CELL_SIZE)),
+                    );
+                    const lastChunk = Math.ceil(
+                        maxVisibleX / (CHUNK_W * CELL_SIZE),
+                    );
+
+                    for (let c = firstChunk; c <= lastChunk; c++) {
+                        if (
+                            gameMode === "CLASSIC" &&
+                            c * CHUNK_W >= CLASSIC_MAX_GX
+                        )
+                            break;
+                        const chunk = ensureChunkRendered(c);
+                        if (!chunk) continue;
+                        const dstX = c * CHUNK_W * CELL_SIZE;
+                        const dstW = CHUNK_W * CELL_SIZE;
+                        ctx.drawImage(
+                            chunk.activeCanvas,
+                            0,
+                            0,
+                            CHUNK_CANVAS_W,
+                            CHUNK_CANVAS_H,
+                            dstX,
+                            0,
+                            dstW,
+                            WORLD_HEIGHT,
+                        );
+                    }
+
+                    if (gameState !== "MENU") {
+                        renderGhosts(minVisibleX, maxVisibleX);
+                    }
+
+                    if (gameState === "PLAYING" || gameState === "CLEARED") {
+                        drawRocketShape(
+                            rocket.x,
+                            rocket.y,
+                            rocket.angle,
+                            rocket.thrust,
+                            false,
+                            1.0,
+                            false,
+                        );
+                    }
+
+                    renderParticles(minVisibleX, maxVisibleX);
+
+                    ctx.restore();
+
+                    renderHUD();
+                    if (gameState === "MENU") {
+                        renderMainMenuOverlay();
+                    } else if (gameState === "CLEARED") {
+                        renderClearedOverlay();
+                    }
+                }
+
+                // ============================================================================
+                // INPUT HANDLING & VISIBILITY PAUSE
+                // ============================================================================
+                function handlePressStart() {
+                    sound.init();
+                    if (gameState === "CLEARED" && stateTimer < 1.9) {
+                        inputHeld = true;
+                        startNewMap("CLASSIC", generateSessionSeed());
+                        return;
+                    }
+                    if (gameState === "PLAYING" || gameState === "DEAD") {
+                        inputHeld = true;
+                    }
+                }
+
+                function handlePressEnd() {
+                    inputHeld = false;
+                }
+
+                canvas.addEventListener(
+                    "pointerdown",
+                    (e) => {
+                        e.preventDefault();
+                        sound.init();
+
+                        const rect = canvas.getBoundingClientRect();
+                        const x = e.clientX - rect.left;
+                        const y = e.clientY - rect.top;
+
+                        // Mute toggle button
+                        if (pointInRect(x, y, muteBtnRect)) {
+                            sound.toggleMute();
+                            return;
+                        }
+
+                        // Main Menu mode selection cards
+                        if (gameState === "MENU") {
+                            if (pointInRect(x, y, classicCardRect)) {
+                                sound.playClick();
+                                startNewMap("CLASSIC", generateSessionSeed());
+                                return;
+                            }
+                            if (pointInRect(x, y, endlessCardRect)) {
+                                sound.playClick();
+                                startNewMap("ENDLESS", generateSessionSeed());
+                                return;
+                            }
+                            return;
+                        }
+
+                        // In-game MENU and NEW MAP buttons
+                        if (pointInRect(x, y, menuBtnRect)) {
+                            sound.playClick();
+                            openMainMenu();
+                            return;
+                        }
+                        if (pointInRect(x, y, newMapBtnRect)) {
+                            sound.playClick();
+                            startNewMap(gameMode, generateSessionSeed());
+                            return;
+                        }
+
+                        handlePressStart();
+                    },
+                    { passive: false },
+                );
+
+                window.addEventListener(
+                    "pointerup",
+                    (e) => {
+                        e.preventDefault();
+                        handlePressEnd();
+                    },
+                    { passive: false },
+                );
+
+                window.addEventListener("pointercancel", () => {
+                    handlePressEnd();
+                });
+
+                window.addEventListener("keydown", (e) => {
+                    if (gameState === "MENU") {
+                        if (
+                            e.code === "Digit1" ||
+                            e.code === "Space" ||
+                            e.code === "Enter"
+                        ) {
+                            e.preventDefault();
+                            sound.init();
+                            sound.playClick();
+                            startNewMap("CLASSIC", generateSessionSeed());
+                        } else if (e.code === "Digit2") {
+                            e.preventDefault();
+                            sound.init();
+                            sound.playClick();
+                            startNewMap("ENDLESS", generateSessionSeed());
+                        } else if (e.code === "KeyM") {
+                            sound.toggleMute();
+                        }
+                        return;
+                    }
+
+                    if (e.code === "Space") {
+                        e.preventDefault();
+                        if (!e.repeat) handlePressStart();
+                    } else if (e.code === "Escape") {
+                        e.preventDefault();
+                        sound.playClick();
+                        openMainMenu();
+                    } else if (e.code === "KeyR") {
+                        e.preventDefault();
+                        sound.playClick();
+                        startNewMap(gameMode, generateSessionSeed());
+                    } else if (e.code === "KeyM") {
+                        sound.toggleMute();
+                    }
+                });
+
+                window.addEventListener("keyup", (e) => {
+                    if (e.code === "Space") {
+                        e.preventDefault();
+                        handlePressEnd();
+                    }
+                });
+
+                document.addEventListener(
+                    "touchmove",
+                    (e) => e.preventDefault(),
+                    { passive: false },
+                );
+
+                document.addEventListener("visibilitychange", () => {
+                    if (document.hidden) {
+                        paused = true;
+                        inputHeld = false;
+                        sound.setThrust(0);
+                    } else {
+                        paused = false;
+                        lastFrameTime = performance.now();
+                    }
+                });
+
+                // ============================================================================
+                // MAIN LOOP (FIXED-TIMESTEP 120 HZ ACCUMULATOR)
+                // ============================================================================
+                openMainMenu();
+
+                let lastFrameTime = performance.now();
+
+                function loop(now) {
+                    requestAnimationFrame(loop);
+                    if (paused) return;
+
+                    let frameDt = (now - lastFrameTime) / 1000;
+                    lastFrameTime = now;
+                    if (frameDt > 0.1) frameDt = 0.1;
+
+                    if (gameState === "PLAYING" || gameState === "DEAD") {
+                        accumulator += frameDt;
+                        while (accumulator >= FIXED_DT) {
+                            stepPhysicsTick();
+                            accumulator -= FIXED_DT;
+                        }
+                    }
+
+                    if (gameState === "DEAD") {
+                        stateTimer -= frameDt;
+                        if (stateTimer <= 0) {
+                            attemptCount++;
+                            startAttempt();
+                        }
+                    } else if (gameState === "CLEARED") {
+                        stateTimer -= frameDt;
+                        if (stateTimer <= 0) {
+                            startNewMap("CLASSIC", generateSessionSeed());
+                        }
+                    }
+
+                    updateVisualEffects(frameDt);
+                    renderFrame(frameDt);
+                }
+
+                requestAnimationFrame(loop);
+            })();
+        </script>
+    </body>
 </html>
